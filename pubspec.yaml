@@ -1,0 +1,41 @@
+name: onelo
+description: Official Flutter/Dart SDK for Onelo — feature flags, paywalls, forms, and waitlists.
+version: 1.25.0
+homepage: https://github.com/onelo-tools/onelo-flutter
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+  webview_flutter: ^4.0.0
+  # Store + Customer Portal presenters use flutter_inappwebview (NOT webview_flutter)
+  # because they must hand the Stripe CARD page off to the SYSTEM BROWSER on
+  # window.open — that needs onCreateWindow, which webview_flutter does not expose
+  # but flutter_inappwebview does (1:1 with Swift's WKUIDelegate.createWebViewWith).
+  flutter_inappwebview: ^6.0.0
+  # OS deep-link receiver for the `<scheme>://callback` return FROM the external
+  # browser card page (equivalent to Swift's SwiftUI `.onOpenURL`).
+  app_links: ^6.0.0
+  flutter_secure_storage: ^9.0.0
+  url_launcher: ^6.0.0
+  crypto: ^3.0.0
+  # Widened so consumer apps can use flutter_web_auth_2 5.x without a dependency
+  # override — we only call authenticate(url:, callbackUrlScheme:), stable across
+  # 3.x–5.x. pub picks the highest version the app's Dart SDK supports (5.x needs
+  # Dart >=3.5), so apps on older Dart still resolve a compatible 3.x/4.x.
+  flutter_web_auth_2: ">=3.0.0 <6.0.0"
+  package_info_plus: ^8.0.0
+  device_info_plus: ^10.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  mocktail: ^1.0.3
+  test: ^1.30.0
+
+flutter:
+  # No assets or fonts for this SDK package
