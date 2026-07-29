@@ -1,6 +1,6 @@
 name: onelo
 description: Official Flutter/Dart SDK for Onelo — feature flags, paywalls, forms, and waitlists.
-version: 1.25.0
+version: 1.28.1
 homepage: https://github.com/onelo-tools/onelo-flutter
 
 environment:
@@ -38,4 +38,15 @@ dev_dependencies:
   test: ^1.30.0
 
 flutter:
-  # No assets or fonts for this SDK package
+  # No assets or fonts for this SDK package.
+  #
+  # Federated plugin: declares an iOS-only native layer (OneloPlugin) that
+  # bridges Apple App Attest (DCAppAttestService) to Dart over the `onelo/attest`
+  # MethodChannel. Autolinks into the host app's Xcode project on `pod install`.
+  # No `android:` entry — Play Integrity is a separate future task, and the Dart
+  # side guards every channel call with a platform check, so the package still
+  # works as a plain package on Android (the channel is simply never invoked).
+  plugin:
+    platforms:
+      ios:
+        pluginClass: OneloPlugin

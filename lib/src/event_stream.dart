@@ -29,12 +29,14 @@ class OneloEventStream {
     required Future<String> Function() instanceId,
     String? environment,
     Future<String?> Function()? getBundleId,
+    Future<String?> Function()? getAttestToken,
   })  : _client = client,
         _apiUrl = apiUrl,
         _publishableKey = publishableKey,
         _instanceId = instanceId,
         _environment = environment,
-        _getBundleId = getBundleId;
+        _getBundleId = getBundleId,
+        _getAttestToken = getAttestToken;
 
   final http.Client _client;
   final String _apiUrl;
@@ -46,6 +48,11 @@ class OneloEventStream {
   /// ids on GET /features/stream without it → the stream would reconnect-loop
   /// forever and realtime (features_updated / session.revoked) would be dead.
   final Future<String?> Function()? _getBundleId;
+  /// Supplies the cached iOS App Attest JWT sent as `X-Attest-Token` on the SSE
+  /// connect. The backend security gate 403s a LIVE app on GET /features/stream
+  /// without it → the stream would reconnect-loop and realtime would be dead.
+  /// Non-blocking; null / omitted off iOS.
+  final Future<String?> Function()? _getAttestToken;
 
   final Map<String, OneloEventHandler> _handlers = {};
   String? _userId;
@@ -141,10 +148,14 @@ class OneloEventStream {
       // X-Bundle-Id as a HEADER (the gate reads the header, not a query param).
       // A stale generation during this await is caught by the post-send check.
       final bundleId = _getBundleId != null ? await _getBundleId!() : null;
+      // X-Attest-Token (iOS App Attest) on the SSE connect. Non-blocking; omitted
+      // off iOS or before attestation completes.
+      final attestToken = _getAttestToken != null ? await _getAttestToken!() : null;
       final request = http.Request('GET', uri)
         ..headers['Accept'] = 'text/event-stream'
         ..headers['X-Sdk-Version'] = oneloFlutterSdkVersion;
       if (bundleId != null && bundleId.isNotEmpty) request.headers['X-Bundle-Id'] = bundleId;
+      if (attestToken != null && attestToken.isNotEmpty) request.headers['X-Attest-Token'] = attestToken;
       final response = await _client.send(request);
       // A newer open()/stop() won the race while we were connecting — abandon
       // this response so we don't leak a subscription the current generation

@@ -119,6 +119,9 @@ class OneloConsent extends ChangeNotifier {
   /// overrides the sync [_bundleId] fallback). The backend security gate 403s a
   /// LIVE app with registered bundle ids on the legal endpoints without it.
   final Future<String?> Function()? _getBundleId;
+  /// Supplies the cached iOS App Attest JWT sent as `X-Attest-Token` (wired to
+  /// OneloAttest.headerToken). Non-blocking; null / omitted off iOS.
+  final Future<String?> Function()? _getAttestToken;
   final http.Client _httpClient;
 
   OneloConsentRequirement? _pendingBlockingConsent;
@@ -134,12 +137,14 @@ class OneloConsent extends ChangeNotifier {
     required OneloAuth auth,
     String? bundleId,
     Future<String?> Function()? getBundleId,
+    Future<String?> Function()? getAttestToken,
     http.Client? httpClient,
   })  : _apiUrl = apiUrl,
         _publishableKey = publishableKey,
         _auth = auth,
         _bundleId = bundleId,
         _getBundleId = getBundleId,
+        _getAttestToken = getAttestToken,
         _httpClient = httpClient ?? http.Client() {
     _lastConsentRevision = _auth.consentRevision;
     _lastSignedIn = _auth.currentSession != null;
@@ -218,6 +223,16 @@ class OneloConsent extends ChangeNotifier {
       try {
         final bid = await getBundle();
         if (bid != null && bid.isNotEmpty) headers['X-Bundle-Id'] = bid;
+      } catch (_) {}
+    }
+    // X-Attest-Token (iOS App Attest) on the legal endpoints. Non-blocking;
+    // omitted off iOS or before attestation completes. Covers both
+    // requiredConsents() and acceptConsent() (they share this builder).
+    final getAttest = _getAttestToken;
+    if (getAttest != null) {
+      try {
+        final at = await getAttest();
+        if (at != null && at.isNotEmpty) headers['X-Attest-Token'] = at;
       } catch (_) {}
     }
     return headers;

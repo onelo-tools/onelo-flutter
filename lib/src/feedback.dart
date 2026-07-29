@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -94,6 +95,26 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
   bool _popped = false;
   String _hostedHost = '';
 
+  /// #40 Phase 2 — true once the hosted feedback page posts `onelo:ready`. From
+  /// then on its OWN canonical ✕ (rendered by the hosted page) owns the close
+  /// affordance, so the native fail-safe ✕ below is hidden.
+  bool _hostedReady = false;
+
+  /// #44 — armed ~3.5s after the sheet appears (see [initState]). The native
+  /// fail-safe ✕ shows ONLY after this grace WITHOUT a ready signal, so a normal
+  /// fast load (which posts `onelo:ready` first) never flashes it.
+  bool _failsafeTimedOut = false;
+  Timer? _failsafeTimer;
+
+  /// #40 Phase 2 — the hosted page mounted → hide the native fail-safe ✕ (the
+  /// hosted ✕ now owns the affordance). Cancels the grace timer so a late timeout
+  /// can't re-show it.
+  void _onHostedReady() {
+    if (_hostedReady) return;
+    _failsafeTimer?.cancel();
+    if (mounted) setState(() => _hostedReady = true);
+  }
+
   /// Single-shot, synchronous close guard. The submit-success postMessage can be
   /// delivered to the channel MORE THAN ONCE (the JS listener is re-injected on
   /// each onPageFinished, and `mounted` doesn't flip synchronously) — without
@@ -114,8 +135,14 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
       ..setBackgroundColor(const Color(0xFF111111))
       ..addJavaScriptChannel('OneloFeedback', onMessageReceived: (msg) {
         final data = jsonDecode(msg.message) as Map<String, dynamic>?;
-        if (data?['type'] == 'onelo:feedback_submitted') {
+        final type = data?['type'];
+        // Both `feedback_submitted` (auto-close on submit) and `feedback_close`
+        // (the canonical hosted ✕ — #40 Phase 2) are terminal → the SAME dismiss.
+        if (type == 'onelo:feedback_submitted' || type == 'onelo:feedback_close') {
           _dismiss();
+        } else if (type == 'onelo:ready') {
+          // Hosted page mounted → hide the native fail-safe ✕.
+          _onHostedReady();
         }
       })
       ..setNavigationDelegate(NavigationDelegate(
@@ -127,7 +154,11 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
             if (!window.__oneloFeedbackBound) {
               window.__oneloFeedbackBound = true;
               window.addEventListener('message', function(e) {
-                if (e.data && e.data.type === 'onelo:feedback_submitted') {
+                if (!e.data || !e.data.type) return;
+                var t = e.data.type;
+                // Relay submit (auto-close), the canonical hosted ✕ close, and the
+                // ready signal (hosted page mounted → hide native fail-safe ✕).
+                if (t === 'onelo:feedback_submitted' || t === 'onelo:feedback_close' || t === 'onelo:ready') {
                   OneloFeedback.postMessage(JSON.stringify(e.data));
                 }
               });
@@ -159,7 +190,19 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
           return NavigationDecision.navigate;
         },
       ));
+    // #44 — arm the fail-safe ✕ only after a ~3.5s grace, so a normal fast load
+    // (which posts `onelo:ready` first) never flashes it; a stuck load still gets
+    // a way out.
+    _failsafeTimer = Timer(const Duration(milliseconds: 3500), () {
+      if (mounted && !_hostedReady) setState(() => _failsafeTimedOut = true);
+    });
     _load();
+  }
+
+  @override
+  void dispose() {
+    _failsafeTimer?.cancel();
+    super.dispose();
   }
 
   void _load() {
@@ -217,17 +260,21 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
           ),
         ]),
 
-        // Unified close affordance: a neutral white ✕ in the top-right,
-        // identical to the Customer Portal view. Routes through the same
-        // dismiss path (Navigator.pop) as the submit-success handler.
-        Positioned(
-          top: 8,
-          right: 8,
-          child: IconButton(
-            icon: const Icon(Icons.close, color: Colors.white),
-            onPressed: _dismiss,
+        // #40 Phase 2 + #44 — the native ✕ is a FAIL-SAFE only. The canonical ✕
+        // is rendered by the hosted page; this one shows ONLY while the hosted ✕
+        // can't exist yet: after a ~3.5s grace WITHOUT `onelo:ready` (a stuck
+        // load) OR when the load failed (the WebView is replaced by the error
+        // view). Hidden the moment the hosted page posts `onelo:ready`. Routes
+        // through the same dismiss path (Navigator.pop) as the submit handler.
+        if (!_hostedReady && (_failsafeTimedOut || _failed))
+          Positioned(
+            top: 8,
+            right: 8,
+            child: IconButton(
+              icon: const Icon(Icons.close, color: Colors.white),
+              onPressed: _dismiss,
+            ),
           ),
-        ),
         ]),
         ),
       ),

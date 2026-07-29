@@ -50,6 +50,24 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
   String? _errorMessage;
   StreamSubscription<void>? _returnSub;
 
+  /// #40 Phase 2 — true once the hosted portal posts `onelo:ready`. From then on
+  /// its OWN canonical ✕ owns the close affordance, so the native fail-safe ✕ is
+  /// hidden.
+  bool _hostedReady = false;
+
+  /// #44 — armed ~3.5s after mount. The native fail-safe ✕ shows ONLY after this
+  /// grace WITHOUT a ready signal (a stuck load), or on a load error, so a normal
+  /// fast load (which posts `onelo:ready` first) never flashes it.
+  bool _failsafeTimedOut = false;
+  Timer? _failsafeTimer;
+
+  /// #40 Phase 2 — the hosted portal mounted → hide the native fail-safe ✕.
+  void _onHostedReady() {
+    if (_hostedReady) return;
+    _failsafeTimer?.cancel();
+    if (mounted) setState(() => _hostedReady = true);
+  }
+
   /// Single-shot dismiss guard — onDismiss (→ Navigator.pop) fires from the Done
   /// deep-link, the external-card return, ✕ and error Close; two in one turn would
   /// pop twice and unwind the host route.
@@ -66,6 +84,12 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
     // "Change plan" → card completes in the EXTERNAL browser and returns via the
     // OS deep-link; Onelo's app_links listener → portal.completeExternalReturn.
     _returnSub = widget.portal.onPortalReturn.listen((_) => _dismiss());
+    // #44 — arm the fail-safe ✕ only after a ~3.5s grace, so a normal fast load
+    // (which posts `onelo:ready` first) never flashes it; a stuck load still gets
+    // a way out.
+    _failsafeTimer = Timer(const Duration(milliseconds: 3500), () {
+      if (mounted && !_hostedReady) setState(() => _failsafeTimedOut = true);
+    });
     _loadPortal();
   }
 
@@ -151,6 +175,7 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
   @override
   void dispose() {
     _returnSub?.cancel();
+    _failsafeTimer?.cancel();
     super.dispose();
   }
 
@@ -167,8 +192,13 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
                 // Marks this as a native container (window.OneloFlutter) + overrides
                 // window.open to divert the Stripe card ("Change plan") to the system
                 // browser (immune to flutter_inappwebview's null-URL onCreateWindow bug).
-                initialUserScripts: oneloBridgeUserScripts(),
-                onWebViewCreated: registerOneloExternalOpenHandler,
+                // withReadyRelay: forward the hosted portal's `onelo:ready`
+                // postMessage → the oneloReady handler → hide the native ✕.
+                initialUserScripts: oneloBridgeUserScripts(withReadyRelay: true),
+                onWebViewCreated: (controller) {
+                  registerOneloExternalOpenHandler(controller);
+                  registerOneloReadyHandler(controller, _onHostedReady);
+                },
                 initialSettings: InAppWebViewSettings(
                   transparentBackground: true,
                   supportMultipleWindows: true,
@@ -210,14 +240,21 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
                 ),
               ),
 
-            Positioned(
-              top: 8,
-              right: 8,
-              child: IconButton(
-                icon: const Icon(Icons.close, color: Colors.white),
-                onPressed: _dismiss,
+            // #40 Phase 2 + #44 — the native ✕ is a FAIL-SAFE only. The canonical
+            // ✕ is rendered by the hosted portal page; this one shows ONLY while
+            // that can't exist yet: after a ~3.5s grace WITHOUT `onelo:ready` (a
+            // stuck load) OR on a load error. Hidden the moment the hosted page
+            // posts `onelo:ready`. Portal close still routes through `source=portal`
+            // (handled in _shouldOverride) — only the ✕'s VISIBILITY changed here.
+            if (!_hostedReady && (_failsafeTimedOut || _errorMessage != null))
+              Positioned(
+                top: 8,
+                right: 8,
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: _dismiss,
+                ),
               ),
-            ),
           ],
         ),
       ),

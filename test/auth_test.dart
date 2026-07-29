@@ -200,6 +200,30 @@ void main() {
       expect(auth.hostedAppName, equals('TestApp'));
     });
 
+    test('#30 — a 403 fetching the hosted URL surfaces initiateError (no silent skeleton hang), and retry clears it', () async {
+      final mock = MockHttpClient();
+      // /auth/initiate → permanent 403 (e.g. attest_invalid); everything else (config) → 200.
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"error":"attest_invalid"}', 403));
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"allow_custom_branding":false}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+
+      // Not swallowed: hostedUrl stays null but the failure is SURFACED for the view.
+      expect(auth.hostedUrl, isNull);
+      expect(auth.initiateError, isNotNull);
+      expect(auth.initiateError, contains("Couldn't start sign-in"));
+
+      // retryInitiate with a now-working endpoint clears the error and loads the URL.
+      reset(mock);
+      when(() => mock.get(any(), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"hosted_url":"https://example.com/auth"}', 200));
+      await auth.retryInitiate();
+      expect(auth.initiateError, isNull);
+      expect(auth.hostedUrl, equals('https://example.com/auth'));
+    });
+
     test('restores session from storage when tokens are present and not expired', () async {
       final storage = FakeSecureStorage();
       final expiresAt = DateTime.now().add(const Duration(hours: 1));

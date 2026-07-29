@@ -46,14 +46,44 @@ const String kOneloWebViewBridgeSource = '''
 })();
 ''';
 
-/// The document-start user script that installs [kOneloWebViewBridgeSource].
+/// #40 Phase 2 — relays the hosted page's `onelo:ready` postMessage (fired on
+/// mount by the Customer Portal / Feedback hosted pages) to the native
+/// `oneloReady` JS handler, so the SDK can hide its native fail-safe ✕ once the
+/// hosted page's own canonical ✕ has taken over. In a native WebView the page is
+/// the top frame, so `window.parent === window` and the message lands on this
+/// same window's listener (mirrors Swift's `onelo://ready` relay). Immune to the
+/// null-URL onCreateWindow bug because it never touches window.open.
+const String kOneloReadyRelaySource = '''
+(function () {
+  try {
+    window.addEventListener('message', function (e) {
+      if (e && e.data && e.data.type === 'onelo:ready'
+          && window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
+        window.flutter_inappwebview.callHandler('oneloReady');
+      }
+    });
+  } catch (e) {}
+})();
+''';
+
+/// The document-start user script(s) that install [kOneloWebViewBridgeSource].
 /// Pass to `InAppWebView(initialUserScripts: oneloBridgeUserScripts())`.
-UnmodifiableListView<UserScript> oneloBridgeUserScripts() =>
+///
+/// [withReadyRelay] additionally installs [kOneloReadyRelaySource], forwarding
+/// the hosted page's `onelo:ready` signal to the `oneloReady` handler — used by
+/// the Customer Portal (whose hosted page renders the canonical ✕). The store
+/// doesn't need it (it renders no hosted ✕), so it's opt-in.
+UnmodifiableListView<UserScript> oneloBridgeUserScripts({bool withReadyRelay = false}) =>
     UnmodifiableListView<UserScript>([
       UserScript(
         source: kOneloWebViewBridgeSource,
         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
       ),
+      if (withReadyRelay)
+        UserScript(
+          source: kOneloReadyRelaySource,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
     ]);
 
 /// Registers the `oneloOpenExternal` handler that the injected `window.open`
@@ -70,6 +100,23 @@ void registerOneloExternalOpenHandler(InAppWebViewController controller) {
       if (uri != null && await canLaunchUrl(uri)) {
         await launchUrl(uri, mode: LaunchMode.externalApplication);
       }
+    },
+  );
+}
+
+/// #40 Phase 2 — registers the `oneloReady` handler that [kOneloReadyRelaySource]
+/// calls when the hosted page posts `onelo:ready`. [onReady] hides the native
+/// fail-safe ✕. Call from `InAppWebView(onWebViewCreated: …)` alongside
+/// [registerOneloExternalOpenHandler].
+void registerOneloReadyHandler(
+  InAppWebViewController controller,
+  void Function() onReady,
+) {
+  controller.addJavaScriptHandler(
+    handlerName: 'oneloReady',
+    callback: (args) {
+      onReady();
+      return null;
     },
   );
 }

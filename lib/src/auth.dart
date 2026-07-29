@@ -7,6 +7,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'attest.dart';
 import 'event_stream.dart';
 import 'types.dart';
 import 'version.dart';
@@ -26,9 +27,32 @@ class OneloAuth extends ChangeNotifier {
   String _hostedAppName = 'App';
   String? _hostedAppLogoUrl;
   String? _hostedUrl;
+  /// #36 — branding page background hex (`checkout_bg_color`, default `#111111`)
+  /// resolved from `/api/sdk/config` and cached to secure storage so it's
+  /// available on the NEXT cold start before the network resolves. Mirrors Swift
+  /// `pageBackgroundColorHex`.
+  String? _pageBackgroundColorHex;
+  /// #36 — true when a stored session was detected at startup (the auto-login
+  /// case), primed synchronously-fast before the async restore. Mirrors Swift
+  /// `hasStoredSessionSync()` / `isRestoringSession`.
+  bool _hasStoredSession = false;
+  /// #30 — non-null when fetching the hosted sign-in URL FAILED (e.g. a permanent
+  /// 403: invalid/spoofed attestation, revoked device, bundle mismatch). The auth
+  /// view shows an error + "Try again" instead of hanging forever on the skeleton
+  /// (parity with RN's OneloAuthGate retry). Cleared on a successful fetch / retry.
+  String? _initiateError;
   String? _pkceVerifier;
   String? _instanceId;
+  bool _attestRequired = false;
   List<String> _oauthProviders = [];
+
+  /// iOS App Attest manager. Owned by [Onelo], set here after construction so
+  /// auth can (a) trigger attestation once `/api/sdk/config` reports
+  /// `attest_required`, and (b) inject the cached `X-Attest-Token` into its OWN
+  /// requests + the shared SSE stream. Mirrors Swift, where `OneloAuth` owns
+  /// `attestRequired` / `attestToken` and kicks off attestation after config
+  /// resolves. Null in pure-Dart tests (attestation is a no-op off iOS anyway).
+  OneloAttest? attest;
   Timer? _heartbeatTimer;
   Timer? _refreshTimer;
   Future<OneloSession?>? _refreshInFlight;
@@ -56,6 +80,24 @@ class OneloAuth extends ChangeNotifier {
   String get hostedAppName => _hostedAppName;
   String? get hostedAppLogoUrl => _hostedAppLogoUrl;
   String? get hostedUrl => _hostedUrl;
+
+  /// #36 — branding page background hex (`checkout_bg_color`, e.g. `#111111`)
+  /// from `/api/sdk/config`, cached across launches. Null until config resolves
+  /// on first-ever launch; OneloAuthView falls back to the default dark colour.
+  /// Used to paint a neutral BRANDED "opening" splash during auto-login instead
+  /// of a blank frame. Mirrors Swift `pageBackgroundColorHex`.
+  String? get pageBackgroundColorHex => _pageBackgroundColorHex;
+
+  /// #36 — true when a stored session was detected at startup (the auto-login
+  /// case). Lets OneloAuthView show the branded splash specifically while an
+  /// existing session is being restored, rather than a blank screen. Mirrors
+  /// Swift `hasStoredSessionSync()` / `isRestoringSession`.
+  bool get hasStoredSession => _hasStoredSession;
+
+  /// #30 — non-null when the hosted sign-in URL couldn't be fetched (permanent
+  /// 403 / network). The auth view renders an error + "Try again" (via
+  /// [retryInitiate]) instead of an endless skeleton. Null on success.
+  String? get initiateError => _initiateError;
 
   /// Social providers enabled for this app (e.g. `['google', 'apple']`), resolved
   /// from `/api/sdk/config`. Empty until [initialize] runs. Mirrors Swift
@@ -90,6 +132,9 @@ class OneloAuth extends ChangeNotifier {
       instanceId: _instanceIdValue,
       environment: featureEnvironment,
       getBundleId: _bundleIdValue,
+      // Late-bound: reads the attest manager (set by Onelo after construction),
+      // so the SSE connect carries X-Attest-Token once attestation completes.
+      getAttestToken: _attestTokenValue,
     );
     // Realtime remote-logout: the backend fans `session.revoked` to ALL
     // subscribers of the app, so filter by `app_user_id` — a missing target is
@@ -132,11 +177,34 @@ class OneloAuth extends ChangeNotifier {
 
   Future<void> initialize() async {
     _isLoading = true;
+    // #36 — prime the "opening" splash state from the cheap secure-storage
+    // signals BEFORE the async restore, then notify, so OneloAuthView can paint
+    // a neutral BRANDED background during auto-login instead of a blank frame.
+    await _primeSplashState();
     notifyListeners();
     try {
       await _restoreSession();
       await _registerPkceChallenge();
-      await _fetchInitiate();
+      // Kick off iOS App Attest in the BACKGROUND when the backend requires it.
+      // Never block SDK readiness on it (parity with Swift, which runs it in a
+      // detached Task): on iOS it normally completes in ~1s. No-op off iOS.
+      if (_attestRequired) {
+        final a = attest;
+        if (a != null) unawaited(a.attestIfNeeded());
+        // #25 — /auth/initiate is attestation-gated, so fetch the hosted URL only
+        // AFTER the token lands (via _fetchInitiate's awaitReady). Fetching it
+        // tokenless here would 403 and leave hostedUrl null → the auth view sticks
+        // on its skeleton. Run it OFF the readiness path; notifyListeners updates
+        // the view when the URL arrives (parity with refreshHostedUrl).
+        // Self-contained error handling: it's unawaited, so a network failure
+        // must not surface as an unhandled async error. On failure the view keeps
+        // its skeleton; a later refreshHostedUrl retries.
+        unawaited(_fetchInitiate().then((_) => notifyListeners()).catchError(
+          (Object e) => debugPrint('[OneloAuth] initiate failed: $e')));
+      } else {
+        // No attestation required → fetch the hosted URL now, as before.
+        await _fetchInitiate();
+      }
     } catch (e, st) {
       debugPrint('[OneloAuth] initialize failed: $e\n$st');
     } finally {
@@ -147,6 +215,30 @@ class OneloAuth extends ChangeNotifier {
       }
       _readyWaiters.clear();
       notifyListeners();
+    }
+  }
+
+  /// #36 — populate the auto-login splash signals from secure storage before the
+  /// (async) session restore: whether a stored session exists (→ this is the
+  /// auto-login case, so the view shows a branded splash not a blank frame) and
+  /// the cached branding page background colour from the last `/api/sdk/config`.
+  /// flutter_secure_storage has no sync read, so this is the fastest available
+  /// signal — mirrors Swift's synchronous `hasStoredSessionSync()` + cached
+  /// `pageBackgroundColorHex`. Best-effort: storage failures leave defaults.
+  Future<void> _primeSplashState() async {
+    try {
+      final accessToken = await _storage.read(key: 'onelo_access_token');
+      final refreshToken = await _storage.read(key: 'onelo_refresh_token');
+      _hasStoredSession = accessToken != null &&
+          accessToken.isNotEmpty &&
+          refreshToken != null &&
+          refreshToken.isNotEmpty;
+      final cachedBg = await _storage.read(key: 'onelo_checkout_bg_color');
+      if (cachedBg != null && cachedBg.isNotEmpty) _pageBackgroundColorHex = cachedBg;
+    } catch (e) {
+      // No platform channel (pure-Dart tests) → keep defaults; the view falls
+      // back to the default branded background and a plain frame.
+      debugPrint('[OneloAuth] splash prime skipped: $e');
     }
   }
 
@@ -326,6 +418,9 @@ class OneloAuth extends ChangeNotifier {
     required String password,
     required bool isRetry,
   }) async {
+    // #25 — gated POST: wait for the attest token on the first attempt (the retry
+    // path already has it). No-op for non-attest apps.
+    if (!isRetry && _attestRequired) await attest?.awaitReady();
     final verifier = _pkceVerifier;
     final response = await _httpClient.post(
       Uri.parse('${_config.apiUrl}$path'),
@@ -460,6 +555,23 @@ class OneloAuth extends ChangeNotifier {
         // Capture metadata if available
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         _allowCustomBranding = (data['allow_custom_branding'] as bool?) ?? false;
+        // Whether the backend requires an iOS App Attest token on live requests
+        // (mirrors Swift `ResolvedConfig.attestRequired`). Drives the background
+        // attestation kicked off in [initialize].
+        _attestRequired = (data['attest_required'] as bool?) ?? false;
+        // #36 — branding page background (checkout_bg_color). Cache it so the
+        // next cold start can paint the branded auto-login splash immediately.
+        if (data['checkout_bg_color'] is String) {
+          final bg = (data['checkout_bg_color'] as String).trim();
+          if (bg.isNotEmpty) {
+            _pageBackgroundColorHex = bg;
+            try {
+              await _storage.write(key: 'onelo_checkout_bg_color', value: bg);
+            } catch (e) {
+              debugPrint('[OneloAuth] bg colour cache failed: $e');
+            }
+          }
+        }
         if (data['app_name'] is String) _hostedAppName = data['app_name'] as String;
         if (data['app_logo_url'] is String) _hostedAppLogoUrl = data['app_logo_url'] as String?;
         if (data['oauth_providers'] is List) {
@@ -500,10 +612,28 @@ class OneloAuth extends ChangeNotifier {
     // mobile app with registered bundle ids without it (e.g. GET /auth/initiate).
     final bid = await _bundleIdValue();
     if (bid != null && bid.isNotEmpty) headers['X-Bundle-Id'] = bid;
+    // X-Attest-Token (iOS App Attest) on auth's OWN transport (/initiate,
+    // /config, /signin, /signup, /refresh, /hosted-callback, …). Non-blocking;
+    // omitted off iOS or before attestation completes.
+    final at = await _attestTokenValue();
+    if (at != null && at.isNotEmpty) headers['X-Attest-Token'] = at;
     if (json) headers['Content-Type'] = 'application/json';
     if (publishableKeyHeader) headers['X-Publishable-Key'] = _config.publishableKey;
     if (bearer != null) headers['Authorization'] = 'Bearer $bearer';
     return headers;
+  }
+
+  /// Non-blocking read of the cached iOS App Attest token from the (late-bound)
+  /// [attest] manager, or null when it isn't set / not yet available. Used by
+  /// auth's own [_headers] and passed to the shared SSE stream. Never throws.
+  Future<String?> _attestTokenValue() async {
+    final a = attest;
+    if (a == null) return null;
+    try {
+      return await a.headerToken();
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Public accessor for the stable per-install id — lets sibling modules
@@ -576,18 +706,49 @@ class OneloAuth extends ChangeNotifier {
   }
 
   Future<void> _fetchInitiate() async {
+    // #25 — /auth/initiate is attestation-gated. Wait for the token so the minted
+    // hostedUrl isn't a tokenless 403 (which would leave hostedUrl null and stick
+    // the auth view on its skeleton). No-op for non-attest apps.
+    if (_attestRequired) await attest?.awaitReady();
     final uri = Uri.parse('${_config.apiUrl}/api/sdk/auth/initiate').replace(
       queryParameters: {
         'key': _config.publishableKey,
         'callback_scheme': _config.callbackScheme,
       },
     );
-    final response = await _httpClient.get(uri, headers: await _headers());
-    if (response.statusCode < 200 || response.statusCode >= 300) return;
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    _hostedUrl = data['hosted_url'] as String?;
-    _hostedAppName = (data['app_name'] as String?) ?? _hostedAppName;
-    _hostedAppLogoUrl = (data['app_logo_url'] as String?) ?? _hostedAppLogoUrl;
+    try {
+      final response = await _httpClient.get(uri, headers: await _headers());
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        _initiateError = null;
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        _hostedUrl = data['hosted_url'] as String?;
+        _hostedAppName = (data['app_name'] as String?) ?? _hostedAppName;
+        _hostedAppLogoUrl = (data['app_logo_url'] as String?) ?? _hostedAppLogoUrl;
+        return;
+      }
+      // #30 — do NOT swallow non-2xx silently. A PERMANENT 403 (invalid/spoofed
+      // attestation, revoked device, bundle mismatch, missing token) would
+      // otherwise leave hostedUrl null → the view hangs forever on the skeleton.
+      // Log it + set an error the view surfaces as "Try again" (parity with RN).
+      debugPrint('[OneloAuth] hosted sign-in unavailable: HTTP ${response.statusCode} — ${response.body}');
+      _initiateError = (response.statusCode >= 500 || response.statusCode == 429)
+          ? 'Sign-in is temporarily unavailable. Please try again.'
+          : "Couldn't start sign-in. Please try again.";
+    } catch (e) {
+      debugPrint('[OneloAuth] hosted sign-in fetch error: $e');
+      _initiateError = 'Connection problem. Check your network and try again.';
+    }
+  }
+
+  /// #30 — retry fetching the hosted sign-in URL after an error (wired to the
+  /// auth view's "Try again" button). Clears the error, re-shows the skeleton
+  /// while retrying, then either loads the page or re-surfaces the error. Parity
+  /// with RN's OneloAuthGate retry.
+  Future<void> retryInitiate() async {
+    _initiateError = null;
+    notifyListeners();
+    await _fetchInitiate();
+    notifyListeners();
   }
 
   Future<void> _restoreSession() async {

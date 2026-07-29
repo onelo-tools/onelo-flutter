@@ -25,6 +25,25 @@ class OneloClient {
   /// gate 403s a LIVE app with registered bundle ids without it.
   final Future<String?> Function()? _getBundleId;
 
+  /// Supplies the cached iOS App Attest JWT sent as `X-Attest-Token` (wired to
+  /// OneloAttest.headerToken). Non-blocking: returns the cached token or null —
+  /// attestation runs off the request path. Null / omitted off iOS. This is the
+  /// central injection point for the features / forms / waitlist / paywall /
+  /// feedback transports, which all route through [_headers] / [securityHeaders].
+  final Future<String?> Function()? _getAttestToken;
+
+  /// FAZA 3 — per-request App Attest assertion headers (method, path, query, body)
+  /// → X-Attest-Key-Id/Assertion/Challenge, or null (no attested key / off iOS)
+  /// → the bearer above still applies. Wired to OneloAttest.assertionHeaders. One
+  /// central injection point for every _post endpoint.
+  final Future<Map<String, String>?> Function(
+      String method, String path, String query, String body)? _getAssertionHeaders;
+
+  /// FAZA 3 — self-heal hook: called with a non-2xx body so a HARD attest reject
+  /// (attest_key_unknown/revoked, invalid_assertion) drops the key + re-attests.
+  /// Wired to OneloAttest.maybeSelfHealFromError.
+  final void Function(dynamic json)? _maybeSelfHeal;
+
   final http.Client _httpClient;
 
   OneloClient({
@@ -34,9 +53,15 @@ class OneloClient {
     this.featureEnvironment,
     Future<String> Function()? getInstanceId,
     Future<String?> Function()? getBundleId,
+    Future<String?> Function()? getAttestToken,
+    Future<Map<String, String>?> Function(String, String, String, String)? getAssertionHeaders,
+    void Function(dynamic)? maybeSelfHeal,
     http.Client? httpClient,
   })  : _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
+        _getAttestToken = getAttestToken,
+        _getAssertionHeaders = getAssertionHeaders,
+        _maybeSelfHeal = maybeSelfHeal,
         _httpClient = httpClient ?? http.Client();
 
   Map<String, String> get sdkHeaders => {
@@ -71,6 +96,16 @@ class OneloClient {
       try {
         final bid = await getBundle();
         if (bid != null && bid.isNotEmpty) h['X-Bundle-Id'] = bid;
+      } catch (_) {}
+    }
+    // X-Attest-Token (iOS App Attest). Non-blocking: sent only once attestation
+    // has produced a cached token; omitted otherwise (off iOS, or before it
+    // completes). Covers features / forms / waitlist / paywall / feedback.
+    final getAttest = _getAttestToken;
+    if (getAttest != null) {
+      try {
+        final at = await getAttest();
+        if (at != null && at.isNotEmpty) h['X-Attest-Token'] = at;
       } catch (_) {}
     }
     return h;
@@ -227,12 +262,27 @@ class OneloClient {
       _post(path, body);
 
   Future<Map<String, dynamic>> _post(String path, Map<String, dynamic> body) async {
+    // FAZA 3 — bodyStr is hashed for the assertion AND sent as the request body,
+    // so client and server hash byte-identical bytes. batch-ping is skipped: it's
+    // the fleet-scale verify-only telemetry path (server replay_guard=NO), so a
+    // native generateAssertion per ping isn't worth it (parity with RN).
+    final bodyStr = jsonEncode(body);
+    final headers = await _headers(json: true);
+    if (!path.endsWith('/batch-ping')) {
+      final ah = await _getAssertionHeaders?.call('POST', path, '', bodyStr);
+      if (ah != null) headers.addAll(ah);
+    }
     final response = await _httpClient.post(
       Uri.parse('$apiUrl$path'),
-      headers: await _headers(json: true),
-      body: jsonEncode(body),
+      headers: headers,
+      body: bodyStr,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (response.body.isNotEmpty) {
+        try {
+          _maybeSelfHeal?.call(jsonDecode(response.body));
+        } catch (_) {}
+      }
       throw Exception('Onelo API error ${response.statusCode}: ${response.body}');
     }
     // 204 No Content (e.g. batch-ping) has an empty body — return an empty map.

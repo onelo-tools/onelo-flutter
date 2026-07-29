@@ -108,6 +108,12 @@ class OneloMonitor {
   /// LIVE app with registered bundle ids on monitor ingest without it. Wired to
   /// OneloAuth.bundleId.
   final Future<String?> Function()? _getBundleId;
+  /// Supplies the cached iOS App Attest JWT sent as `X-Attest-Token` (wired to
+  /// OneloAttest.headerToken). Monitor has its OWN transport (separate http.Client
+  /// for tight timeouts), so it must inject the token itself — the backend's
+  /// `validate_sdk_request_security` requires it on live mobile ingest. Non-blocking;
+  /// null / omitted off iOS.
+  final Future<String?> Function()? _getAttestToken;
   final FlutterSecureStorage _storage;
 
   late final http.Client _httpClient;
@@ -168,12 +174,14 @@ class OneloMonitor {
     Future<String> Function()? getInstanceId,
     String? bundleId,
     Future<String?> Function()? getBundleId,
+    Future<String?> Function()? getAttestToken,
     http.Client? httpClient,
     FlutterSecureStorage? secureStorage,
   })  : _environment = environment,
         _getInstanceId = getInstanceId,
         _bundleId = bundleId,
         _getBundleId = getBundleId,
+        _getAttestToken = getAttestToken,
         _storage = secureStorage ?? const FlutterSecureStorage() {
     _httpClient = httpClient ?? http.Client();
     _flushTimer = Timer.periodic(const Duration(seconds: 15), (_) => flush());
@@ -538,6 +546,15 @@ class OneloMonitor {
       try {
         final bid = await getBundle();
         if (bid != null && bid.isNotEmpty) h['X-Bundle-Id'] = bid;
+      } catch (_) {}
+    }
+    // X-Attest-Token (iOS App Attest) on monitor ingest. Non-blocking; omitted
+    // off iOS or before attestation completes.
+    final getAttest = _getAttestToken;
+    if (getAttest != null) {
+      try {
+        final at = await getAttest();
+        if (at != null && at.isNotEmpty) h['X-Attest-Token'] = at;
       } catch (_) {}
     }
     return h;

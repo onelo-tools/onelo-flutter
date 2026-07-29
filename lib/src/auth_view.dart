@@ -424,15 +424,78 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     } catch (_) {}
   }
 
+  /// #30 — error state shown when the hosted sign-in URL can't be fetched. On the
+  /// dark branding background (matches the skeleton), with a "Try again" that
+  /// re-fetches via [OneloAuth.retryInitiate].
+  Widget _errorScaffold(String message) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF111111),
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 15, height: 1.4),
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: () => widget.auth.retryInitiate(),
+                  child: const Text('Try again'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// #36 — the branding page background (`checkout_bg_color`) as a Color, parsed
+  /// from the hex auth resolved/cached from `/api/sdk/config`. Accepts `#RRGGBB`
+  /// / `#AARRGGBB` (with or without `#`); defaults to the same dark `#111111`
+  /// used by the skeleton + error scaffold so an unbranded app still looks right.
+  Color _brandedBgColor() {
+    const fallback = Color(0xFF111111);
+    final hex = widget.auth.pageBackgroundColorHex;
+    if (hex == null) return fallback;
+    var h = hex.trim();
+    if (h.startsWith('#')) h = h.substring(1);
+    if (h.length == 6) h = 'FF$h';
+    if (h.length != 8) return fallback;
+    final value = int.tryParse(h, radix: 16);
+    return value == null ? fallback : Color(value);
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Not ready yet — show plain background, no branded content
+    // Not ready yet. #36 — during cold-start auto-login (a stored session is
+    // being restored) paint a NEUTRAL BRANDED background (the branding page
+    // colour, cached from the last /api/sdk/config) instead of a blank/white
+    // flash — no form, no spinner, mirroring Swift's isRestoringSession state.
+    // A genuine no-session cold start keeps the plain frame; it transitions
+    // straight into the hosted sign-in WebView once ready.
     if (!widget.auth.isReady) {
+      if (widget.auth.hasStoredSession) {
+        return Scaffold(backgroundColor: _brandedBgColor());
+      }
       return const Scaffold();
     }
     // Signed in — show the app
     if (widget.auth.currentSession != null) {
       return widget.child;
+    }
+    // #30 — the hosted sign-in URL couldn't be fetched (e.g. a permanent 403 from
+    // invalid/spoofed attestation, a revoked device, or a bundle mismatch). Show
+    // an error + "Try again" instead of hanging forever on the skeleton (parity
+    // with RN's OneloAuthGate retry screen).
+    final initiateError = widget.auth.initiateError;
+    if (initiateError != null && widget.auth.hostedUrl == null) {
+      return _errorScaffold(initiateError);
     }
     // Not signed in — show hosted WebView
     final controller = _controller;

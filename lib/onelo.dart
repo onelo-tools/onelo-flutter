@@ -5,6 +5,7 @@ import 'package:app_links/app_links.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
+import 'src/attest.dart';
 import 'src/auth.dart';
 import 'src/client.dart';
 import 'src/types.dart';
@@ -45,6 +46,7 @@ class Onelo {
   late final OneloCustomerPortal customerPortal;
   late final OneloStore store;
   late final OneloConsent consent;
+  late final OneloAttest attest;
   late final VoidCallback _authListener;
 
   // OS deep-link receiver for the `<scheme>://callback` return FROM the external
@@ -143,6 +145,19 @@ class Onelo {
     http.Client? httpClient,
   }) {
     final env = _normalizeFeatureEnvironment(featureEnvironment);
+    // iOS App Attest manager. Owns the token lifecycle (native channel + HTTP
+    // exchange + secure-storage cache). Its non-blocking [OneloAttest.headerToken]
+    // is threaded into EVERY transport's header builder so `X-Attest-Token` rides
+    // once available. Auth owns the trigger: it reads `attest_required` from
+    // /api/sdk/config and calls [OneloAttest.attestIfNeeded] in the background.
+    // No-op off iOS. Shares auth's persisted install id for X-Onelo-Instance-Id.
+    attest = OneloAttest(
+      apiUrl: apiUrl,
+      publishableKey: publishableKey,
+      getInstanceId: auth.instanceId,
+      httpClient: httpClient,
+    );
+    auth.attest = attest;
     final client = OneloClient(
       publishableKey: publishableKey,
       apiUrl: apiUrl,
@@ -155,6 +170,13 @@ class Onelo {
       // with registered bundle ids without it. auth owns the memoized resolver so
       // all modules send ONE value (parity with Swift/Android capturing it at init).
       getBundleId: auth.bundleId,
+      // X-Attest-Token on every client request (features/forms/waitlist/paywall/feedback).
+      getAttestToken: attest.headerToken,
+      // FAZA 3 — per-request assertion + self-heal (adapter: client wants a
+      // positional fn; assertionHeaders takes named args).
+      getAssertionHeaders: (m, path, q, b) =>
+          attest.assertionHeaders(method: m, path: path, query: q, body: b),
+      maybeSelfHeal: attest.maybeSelfHealFromError,
       httpClient: httpClient,
     );
     monitor = OneloMonitor(
@@ -163,6 +185,7 @@ class Onelo {
       environment: environment,
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
+      getAttestToken: attest.headerToken,
       httpClient: httpClient,
     );
     // Install unhandled-error capture at init (parity with Swift, which installs
@@ -194,6 +217,7 @@ class Onelo {
       onSessionInvalidated: auth.signOut,
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
+      getAttestToken: attest.headerToken,
       httpClient: httpClient,
     );
     store = OneloStore(
@@ -204,6 +228,7 @@ class Onelo {
       exchangeCode: auth.exchangeCode,
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
+      getAttestToken: attest.headerToken,
       httpClient: httpClient,
     );
     consent = OneloConsent(
@@ -211,6 +236,7 @@ class Onelo {
       publishableKey: publishableKey,
       auth: auth,
       getBundleId: auth.bundleId,
+      getAttestToken: attest.headerToken,
       httpClient: httpClient,
     );
 

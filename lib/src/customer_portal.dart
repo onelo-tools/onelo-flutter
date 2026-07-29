@@ -42,6 +42,10 @@ class OneloCustomerPortal {
   /// portal-initiate without it. Wired to OneloAuth.bundleId.
   final Future<String?> Function()? _getBundleId;
 
+  /// Supplies the cached iOS App Attest JWT sent as `X-Attest-Token` (wired to
+  /// OneloAttest.headerToken). Non-blocking; null / omitted off iOS.
+  final Future<String?> Function()? _getAttestToken;
+
   final http.Client _httpClient;
 
   OneloCustomerPortal({
@@ -52,6 +56,7 @@ class OneloCustomerPortal {
     Future<void> Function()? onSessionInvalidated,
     Future<String> Function()? getInstanceId,
     Future<String?> Function()? getBundleId,
+    Future<String?> Function()? getAttestToken,
     http.Client? httpClient,
   })  : _apiUrl = apiUrl,
         _publishableKey = publishableKey,
@@ -60,6 +65,7 @@ class OneloCustomerPortal {
         _onSessionInvalidated = onSessionInvalidated,
         _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
+        _getAttestToken = getAttestToken,
         _httpClient = httpClient ?? http.Client();
 
   /// The deep-link callback scheme this SDK uses (e.g. `myapp`).
@@ -170,6 +176,15 @@ class OneloCustomerPortal {
       try {
         final bid = await getBundle();
         if (bid != null && bid.isNotEmpty) headers['X-Bundle-Id'] = bid;
+      } catch (_) {}
+    }
+    // X-Attest-Token (iOS App Attest) on portal-initiate. Non-blocking; omitted
+    // off iOS or before attestation completes.
+    final getAttest = _getAttestToken;
+    if (getAttest != null) {
+      try {
+        final at = await getAttest();
+        if (at != null && at.isNotEmpty) headers['X-Attest-Token'] = at;
       } catch (_) {}
     }
 

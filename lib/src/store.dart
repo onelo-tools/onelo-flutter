@@ -49,6 +49,10 @@ class OneloStore {
   /// so store-initiate / upgrade-initiate need it. Wired to OneloAuth.bundleId.
   final Future<String?> Function()? _getBundleId;
 
+  /// Supplies the cached iOS App Attest JWT sent as `X-Attest-Token` (wired to
+  /// OneloAttest.headerToken). Non-blocking; null / omitted off iOS.
+  final Future<String?> Function()? _getAttestToken;
+
   final http.Client _httpClient;
 
   /// Fires when the external-browser card checkout returns via the OS deep-link
@@ -64,6 +68,7 @@ class OneloStore {
     required Future<void> Function(String code) exchangeCode,
     Future<String> Function()? getInstanceId,
     Future<String?> Function()? getBundleId,
+    Future<String?> Function()? getAttestToken,
     http.Client? httpClient,
   })  : _apiUrl = apiUrl,
         _publishableKey = publishableKey,
@@ -72,6 +77,7 @@ class OneloStore {
         _exchangeCode = exchangeCode,
         _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
+        _getAttestToken = getAttestToken,
         _httpClient = httpClient ?? http.Client();
 
   /// Common security headers for the gated initiate endpoints: SDK version, the
@@ -95,6 +101,15 @@ class OneloStore {
       try {
         final bid = await getBundle();
         if (bid != null && bid.isNotEmpty) headers['X-Bundle-Id'] = bid;
+      } catch (_) {}
+    }
+    // X-Attest-Token (iOS App Attest) on store-initiate / upgrade-initiate.
+    // Non-blocking; omitted off iOS or before attestation completes.
+    final getAttest = _getAttestToken;
+    if (getAttest != null) {
+      try {
+        final at = await getAttest();
+        if (at != null && at.isNotEmpty) headers['X-Attest-Token'] = at;
       } catch (_) {}
     }
     return headers;
