@@ -54,6 +54,16 @@ class MonitorBreadcrumb {
 }
 
 class _BufferedEvent {
+  /// ISO-8601 UTC, stamped when the event HAPPENED — not when it is sent.
+  ///
+  /// The backend clamps this to a 1 h staleness window and falls back to ingest
+  /// time when it is absent (`_resolve_event_ts` in sdk_monitor.py), so without
+  /// it a batch that waited out an outage is recorded as having happened the
+  /// moment the outage ENDED — calm during the failure, phantom spike after.
+  /// Parity with onelo-python / node / php, which have always sent it.
+  ///
+  /// NOTE: unrelated to the `ts` on a [MonitorBreadcrumb] (unix seconds, in meta).
+  final String ts;
   final String featureName;
   final bool ok;
   final int? durationMs;
@@ -64,6 +74,7 @@ class _BufferedEvent {
   final Map<String, dynamic>? meta;
 
   _BufferedEvent({
+    required this.ts,
     required this.featureName,
     required this.ok,
     this.durationMs,
@@ -75,6 +86,7 @@ class _BufferedEvent {
   });
 
   Map<String, dynamic> toJson() => {
+        'ts': ts,
         'featureName': featureName,
         'ok': ok,
         if (durationMs != null) 'durationMs': durationMs,
@@ -87,15 +99,51 @@ class _BufferedEvent {
       };
 }
 
+/// One feature name's aggregated call count plus the ISO-8601 UTC time of the
+/// FIRST call in the current window (see [OneloMonitor.trackFeatureCall]).
+class _SummaryEntry {
+  final int calls;
+  final String firstTs;
+  const _SummaryEntry(this.calls, this.firstTs);
+}
+
+/// ISO-8601 UTC for "right now" — the moment an event HAPPENED. Byte-identical
+/// to JavaScript's `toISOString()`, which is what the other Onelo SDKs send.
+String _eventTs() => DateTime.now().toUtc().toIso8601String();
+
+/// What ONE delivery attempt means for the batch.
+///
+/// - [done]    — the server ACCEPTED it. Settled; never send again.
+/// - [requeue] — the server did NOT take it (429, 5xx, network, timeout). Put it
+///               back and let the next flush carry it.
+/// - [drop]    — permanently rejected (4xx other than 429: bad key, malformed
+///               payload). Re-sending would fail identically forever, so we
+///               discard it — but LOUDLY, never silently.
+enum _SendOutcome { done, requeue, drop }
+
 /// Error / performance monitoring — Swift-parity implementation.
 ///
 /// Buffers events in memory (max [_maxBufferSize], oldest dropped on overflow)
 /// and ships them to Onelo in a single HTTP batch every 15 s; error events flush
-/// immediately. Like the Swift SDK, failed batches are dropped — NOT retried or
-/// persisted to disk in this version. On the error path it auto-attaches the
-/// stack, error type, recent breadcrumbs, active feature flags and device
-/// context. Sensitive values are redacted on-device before send (see
-/// [MonitorScrubber]).
+/// immediately. On the error path it auto-attaches the stack, error type, recent
+/// breadcrumbs, active feature flags and device context. Sensitive values are
+/// redacted on-device before send (see [MonitorScrubber]).
+///
+/// Delivery is ONE attempt per flush (1:1 with `@onelo/js`): 2xx is done; 429
+/// re-queues and honours `Retry-After` as a hold-off before the next flush;
+/// 5xx / network / timeout re-queue; other 4xx are dropped with their status
+/// logged (a bad key will not fix itself). The 15 s flush timer IS the retry, so
+/// a backend outage costs the SAME request volume as healthy operation — an
+/// in-flight retry loop tripled it at the worst possible moment, and left
+/// [destroy] awaiting a chain with no ceiling. An undelivered batch is re-queued
+/// at the FRONT of the buffer, which stays capped at [_maxBufferSize] — under a
+/// sustained outage newest events win and the oldest re-queued events are
+/// trimmed first, every drop logged with its count. There is deliberately NO
+/// disk persistence: events that outlive the process are lost (tracked as
+/// separate, larger work).
+///
+/// Every event carries a `ts` stamped when it was CREATED, so a batch that
+/// waited out an outage is still recorded at the time it happened.
 class OneloMonitor {
   final String publishableKey;
   final String apiUrl;
@@ -119,12 +167,29 @@ class OneloMonitor {
   late final http.Client _httpClient;
 
   final List<_BufferedEvent> _buffer = [];
-  final Map<String, int> _summaryBuffer = {};
+  final Map<String, _SummaryEntry> _summaryBuffer = {};
   final List<MonitorBreadcrumb> _breadcrumbs = [];
   final Map<String, String> _flagBuffer = {};
 
   Timer? _flushTimer;
   String? _currentUserId;
+
+  /// Serialises every drain so the 15 s timer, an error auto-flush and an
+  /// explicit [flush] can never overlap: a retried send now spans seconds, and
+  /// two concurrent drains would interleave batches — the second one observing
+  /// an empty buffer and reporting "sent" while the first is still in flight.
+  Future<void> _flushChain = Future<void>.value();
+
+  /// Epoch ms until which sending is held off (set from a 429 `Retry-After`).
+  int _retryAfterUntilMs = 0;
+
+  /// Set by [destroy] AFTER the final flush — stops a drain from doing work on
+  /// a torn-down instance.
+  bool _destroyed = false;
+
+  /// Running total of events evicted by the buffer cap, so the log line reports
+  /// how much telemetry was lost rather than dropping in silence.
+  int _droppedEvents = 0;
   // The exact wrapper closures we installed into FlutterError.onError /
   // PlatformDispatcher.onError. Kept so a re-invocation can tell "still ours"
   // (→ true no-op) from "something replaced it after us" (→ re-wrap to chain the
@@ -145,6 +210,14 @@ class OneloMonitor {
 
   static const String _sdkName = 'onelo-flutter';
   static const int _maxBufferSize = 200;
+  static const int _maxRetryAfterMs = 3600000;
+  /// `package:http`'s default client has NO timeout, so a hung backend could
+  /// park a drain — and therefore [destroy] — indefinitely. One attempt with a
+  /// real ceiling is what makes teardown bounded.
+  static const Duration _requestTimeout = Duration(seconds: 5);
+  /// Hard ceiling on [destroy]'s final flush, so teardown can never be delayed
+  /// by an unresponsive backend.
+  static const Duration _destroyFlushTimeout = Duration(seconds: 6);
   static const int _breadcrumbCapacity = 100;
   static const int _flagCapacity = 100;
   // Payload clamps — the backend rejects the WHOLE batch (422) when an event's
@@ -189,6 +262,19 @@ class OneloMonitor {
     _loadSessionId();
     _loadAppInfo();
     _loadDeviceInfo();
+    // NOTE: no WidgetsBindingObserver. It existed ONLY to cut short a pending
+    // retry backoff when the app resumed; with one attempt per flush there is no
+    // backoff to wake, so the observer (and its binding-dependent registration)
+    // is gone.
+    // Auto-emit one unconditional event per construction. An app that gates
+    // every instrumented operation behind sign-in/paywall/consent would
+    // otherwise emit NOTHING on a cold start — the dashboard would look
+    // "not integrated" even though every line of the snippet was followed
+    // correctly. This event needs no gate to exist: it fires the moment the
+    // SDK is constructed, so Feature Health always has at least one row.
+    // Named `session_opened` (not `_started`/`_completed`, per the Monitor
+    // naming convention) for cross-platform parity with `@onelo/js`.
+    _push(featureName: 'session_opened', ok: true, source: 'event');
   }
 
   // ── Identity ───────────────────────────────────────────────────────────────
@@ -257,7 +343,12 @@ class OneloMonitor {
   /// flushed as a single `feature_call_summary` event (with `meta.calls`) rather
   /// than one event per call — matches the Swift summary path.
   void trackFeatureCall(String featureName) {
-    _summaryBuffer.update(featureName, (v) => v + 1, ifAbsent: () => 1);
+    final existing = _summaryBuffer[featureName];
+    // The stamp is the FIRST call of this window, so the summary reports when
+    // the calls happened rather than when the drain that shipped them ran.
+    _summaryBuffer[featureName] = existing == null
+        ? _SummaryEntry(1, _eventTs())
+        : _SummaryEntry(existing.calls + 1, existing.firstTs);
   }
 
   // ── Breadcrumbs ──────────────────────────────────────────────────────────
@@ -381,8 +472,13 @@ class OneloMonitor {
       if (flags.isNotEmpty) enriched['flags'] = flags;
     }
 
-    if (_buffer.length >= _maxBufferSize) _buffer.removeAt(0);
+    if (_buffer.length >= _maxBufferSize) {
+      _buffer.removeAt(0);
+      _noteDropped(1);
+    }
     _buffer.add(_BufferedEvent(
+      // Stamped HERE — when the event HAPPENED, not when a later flush ships it.
+      ts: _eventTs(),
       featureName: featureName,
       ok: ok,
       durationMs: durationMs,
@@ -491,39 +587,143 @@ class OneloMonitor {
 
   // ── Flush / lifecycle ─────────────────────────────────────────────────────
 
-  Future<void> flush() async {
+  /// Ship whatever is buffered. Never throws — monitoring must not crash or
+  /// block the host app. Drains are serialised through [_flushChain].
+  Future<void> flush() {
+    _flushChain = _flushChain.then((_) => _drain()).catchError((Object _) {});
+    return _flushChain;
+  }
+
+  Future<void> _drain() async {
+    // Fold pending summary counters into the BUFFER (not a detached list) so a
+    // failed send re-queues them along with everything else instead of losing
+    // them outright.
     _drainSummary();
-    if (_buffer.isEmpty) return;
+    if (_buffer.isEmpty || _destroyed) return;
+    // Server told us to back off (429/Retry-After) — leave the events buffered;
+    // they go out on the first flush after the hold-off expires.
+    if (DateTime.now().millisecondsSinceEpoch < _retryAfterUntilMs) return;
+
     final events = List<_BufferedEvent>.from(_buffer);
     _buffer.clear();
 
-    final headers = await _buildHeaders();
+    final url = Uri.parse('$apiUrl/api/sdk/monitor/events/batch');
+    final body = jsonEncode({
+      'publishableKey': publishableKey,
+      'events': events.map((e) => e.toJson()).toList(),
+    });
+
+    // ONE attempt. Anything the server did not accept goes straight back in the
+    // buffer and rides the next 15 s tick — the flush timer IS the retry.
+    if (await _sendOnce(url, body) == _SendOutcome.requeue) _requeue(events);
+  }
+
+  /// One POST. Never throws — classifies the result instead. Unlike the old
+  /// implementation this inspects the RESPONSE: `http` only throws on transport
+  /// errors, so status classification is the only thing standing between a 503
+  /// and a silently destroyed batch.
+  Future<_SendOutcome> _sendOnce(Uri url, String body) async {
+    http.Response res;
     try {
-      await _httpClient.post(
-        Uri.parse('$apiUrl/api/sdk/monitor/events/batch'),
-        headers: headers,
-        body: jsonEncode({
-          'publishableKey': publishableKey,
-          'events': events.map((e) => e.toJson()).toList(),
-        }),
-      );
+      final headers = await _buildHeaders();
+      // `package:http`'s default client has no timeout of its own, so without
+      // this a hung backend parks the drain — and any teardown awaiting it —
+      // forever.
+      res = await _httpClient
+          .post(url, headers: headers, body: body)
+          .timeout(_requestTimeout);
     } catch (_) {
-      // silently drop — monitoring must never crash the app (parity with Swift:
-      // no retry / no disk persistence in this version)
+      return _SendOutcome.requeue; // network / DNS / timeout — try the next flush
     }
+
+    final status = res.statusCode;
+    if (status >= 200 && status < 300) return _SendOutcome.done;
+    if (status == 429) {
+      final waitMs = _parseRetryAfter(res);
+      if (waitMs > 0) {
+        final until = DateTime.now().millisecondsSinceEpoch + waitMs;
+        if (until > _retryAfterUntilMs) _retryAfterUntilMs = until;
+      }
+      // Rate limited: stop hammering, but the server did NOT accept these
+      // events — re-queue them so they go out once the hold-off expires.
+      return _SendOutcome.requeue;
+    }
+    if (status >= 400 && status < 500) {
+      // 401 invalid key, 403 forbidden, 422 validation — identical every time,
+      // so re-queueing would wedge the buffer forever. Drop, but say so.
+      _warn('batch rejected with HTTP $status — dropping ${_batchNote(body)}');
+      return _SendOutcome.drop;
+    }
+    return _SendOutcome.requeue; // 5xx (and anything unrecognised) — next flush
+  }
+
+  /// Seconds-form `Retry-After` → ms, clamped. Tolerates a missing/garbage
+  /// header (test doubles, proxies) — never throws.
+  static int _parseRetryAfter(http.Response res) {
+    final raw = res.headers['retry-after'] ?? res.headers['Retry-After'];
+    if (raw == null) return 0;
+    final seconds = double.tryParse(raw.trim());
+    if (seconds == null || !seconds.isFinite) return 0;
+    final ms = (seconds * 1000).round();
+    return ms.clamp(0, _maxRetryAfterMs);
+  }
+
+  /// Put an undelivered batch back at the FRONT of the buffer so the next flush
+  /// retries it, then re-apply the cap.
+  ///
+  /// Priority policy under a sustained outage: NEWEST EVENTS WIN. The buffer is
+  /// trimmed from the front, so the oldest re-queued events go first. This
+  /// matches [_push]'s eviction, keeps memory bounded at [_maxBufferSize] no
+  /// matter how long the backend is down, and stops a stuck batch from starving
+  /// live telemetry. Bounded dropping is fine; silence is not.
+  void _requeue(List<_BufferedEvent> events) {
+    _buffer.insertAll(0, events);
+    var dropped = 0;
+    while (_buffer.length > _maxBufferSize) {
+      _buffer.removeAt(0);
+      dropped++;
+    }
+    if (dropped > 0) _droppedEvents += dropped;
+    _warn(
+      'batch not delivered — '
+      '${events.length} event(s) re-queued'
+      '${dropped > 0 ? ', $dropped oldest dropped (buffer cap $_maxBufferSize, '
+          '$_droppedEvents total)' : ''}',
+    );
+  }
+
+  /// Overflow eviction from [_push]. Logged with a running total, but throttled
+  /// (first drop, then every 50) so a hot loop reports the loss without turning
+  /// the console into the new bottleneck.
+  void _noteDropped(int count) {
+    final before = _droppedEvents;
+    _droppedEvents += count;
+    if (before == 0 || _droppedEvents ~/ 50 != before ~/ 50) {
+      _warn('buffer full ($_maxBufferSize) — dropped oldest event(s), '
+          '$_droppedEvents total dropped');
+    }
+  }
+
+  static String _batchNote(String body) => '${body.length} byte(s) of events';
+
+  static void _warn(String message) {
+    // debugPrint is rate-limiting + release-safe, and never throws into the app.
+    debugPrint('[onelo.monitor] $message');
   }
 
   void _drainSummary() {
     if (_summaryBuffer.isEmpty) return;
-    _summaryBuffer.forEach((name, count) {
-      if (count <= 0) return;
+    _summaryBuffer.forEach((name, entry) {
+      if (entry.calls <= 0) return;
       _buffer.add(_BufferedEvent(
+        // When the first call of this window happened — NOT drain time.
+        ts: entry.firstTs,
         featureName: name,
         ok: true,
         source: 'feature_call_summary',
         userId: _currentUserId,
         sessionId: _sessionId,
-        meta: _enrichMeta({'calls': count}, includeContext: false),
+        meta: _enrichMeta({'calls': entry.calls}, includeContext: false),
       ));
     });
     _summaryBuffer.clear();
@@ -560,9 +760,26 @@ class OneloMonitor {
     return h;
   }
 
+  /// Teardown: stop the periodic timer, make one last BOUNDED delivery attempt,
+  /// then mark the instance dead so no in-flight work outlives it. Anything
+  /// still buffered at that point is lost — there is no disk spill.
+  ///
+  /// The await has a hard ceiling. Previously it awaited [_flushChain], which
+  /// could contain a drain sitting in a retry backoff behind a timeout-less HTTP
+  /// client — i.e. no ceiling at all. Now the drain is one timed request, and
+  /// this adds a belt-and-braces bound on top so an unresponsive backend can
+  /// never stall a host that is shutting down.
   Future<void> destroy() async {
     _flushTimer?.cancel();
     _flushTimer = null;
-    await flush();
+    // Clear any hold-off so the final flush actually attempts a send.
+    _retryAfterUntilMs = 0;
+    try {
+      await flush().timeout(_destroyFlushTimeout);
+    } catch (_) {
+      // Timed out or failed — the batch stays buffered and is simply lost with
+      // the process. Teardown must not throw into the host.
+    }
+    _destroyed = true;
   }
 }

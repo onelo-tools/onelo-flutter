@@ -136,13 +136,14 @@ Map<String, dynamic> _sessionResponse({String userId = 'user-bridge-test'}) => {
     };
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   setUpAll(() => registerFallbackValue(FakeUri()));
 
   test('features.load is called with userId when auth session is established', () async {
     final mock = MockHttpClient();
     final List<String> postBodies = [];
 
-    when(() => mock.get(any())).thenAnswer((_) async =>
+    when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async =>
         http.Response('{"hosted_url":"https://example.com/auth","app_name":"App","allow_custom_branding":false}', 200));
 
     when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
@@ -171,8 +172,10 @@ void main() {
 
     // Simulate hosted-flow code exchange
     await auth.exchangeCode('test_code');
-    // Yield to let the synchronous mock's async listener complete
-    await Future.delayed(Duration.zero);
+    // Let the auth->features bridge's fire-and-forget features.load(userId)
+    // chain finish (disk-cache read, then the resolve POST) — a single
+    // Duration.zero tick isn't enough to drain that many awaits.
+    await Future.delayed(const Duration(milliseconds: 100));
 
     // After sign-in, bridge should have triggered features.load(userId)
     // Verify by checking that a features/resolve POST was made with the userId
@@ -195,7 +198,7 @@ void main() {
     final mock = MockHttpClient();
     final List<String> postBodies = [];
 
-    when(() => mock.get(any())).thenAnswer((_) async =>
+    when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async =>
         http.Response('{"hosted_url":"https://example.com/auth","app_name":"App","allow_custom_branding":false}', 200));
 
     when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
@@ -227,8 +230,10 @@ void main() {
     await auth.signOut();
 
     // After sign-out, bridge fires features.load(null) → resolve POST without userId
-    // Yield to let the synchronous mock's async listener complete
-    await Future.delayed(Duration.zero);
+    // Let the auth->features bridge's fire-and-forget features.load(userId)
+    // chain finish (disk-cache read, then the resolve POST) — a single
+    // Duration.zero tick isn't enough to drain that many awaits.
+    await Future.delayed(const Duration(milliseconds: 100));
     final resolveCall = postBodies.where(
       (b) {
         try {

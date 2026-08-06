@@ -68,7 +68,9 @@ void main() {
     final m = makeMonitor();
     m.event('x', const MonitorEventOptions(ok: true));
     await settle(m);
-    final ev = allEvents().single;
+    // The constructor auto-emits an unconditional `session_opened` event
+    // (see monitor.dart) so a batch is never just the one this test pushed.
+    final ev = allEvents().firstWhere((e) => e['featureName'] == 'x');
     expect(ev['platform'], 'flutter');
     expect((ev['meta']['sdk'] as Map)['name'], 'onelo-flutter');
     expect((ev['meta']['sdk'] as Map)['version'], isNotEmpty);
@@ -153,7 +155,18 @@ void main() {
     final m = makeMonitor(environment: 'staging');
     m.event('x', const MonitorEventOptions(ok: true));
     await settle(m);
-    expect(allEvents().single['meta']['environment'], 'staging');
+    // The constructor's auto-emitted `session_opened` event also carries
+    // `environment`, so pick the event this test actually pushed.
+    expect(allEvents().firstWhere((e) => e['featureName'] == 'x')['meta']['environment'], 'staging');
+  });
+
+  test('constructor auto-emits an unconditional session_opened event', () async {
+    final m = makeMonitor();
+    await settle(m);
+    final ev = allEvents().firstWhere((e) => e['featureName'] == 'session_opened');
+    expect(ev['ok'], true);
+    expect(ev['source'], 'event');
+    expect(ev['error'], isNull);
   });
 
   test('buffer caps at 200, dropping the oldest', () async {
@@ -227,5 +240,205 @@ void main() {
       FlutterError.onError = savedFlutter;
       PlatformDispatcher.instance.onError = savedPlatform;
     }
+  });
+
+  // ── Delivery policy ────────────────────────────────────────────────────────
+  // ONE attempt per flush. 2xx → done; 429 / 5xx / network → re-queue and the
+  // NEXT flush carries it (the 15 s timer IS the retry); other 4xx → dropped.
+  // Buffer stays capped.
+
+  // Re-arms the mock with a scripted sequence of responses/throws.
+  void script(List<Object> outcomes) {
+    var i = 0;
+    when(() => client.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+        .thenAnswer((inv) async {
+      bodies.add(jsonDecode(inv.namedArguments[#body] as String) as Map<String, dynamic>);
+      final o = outcomes[i < outcomes.length ? i : outcomes.length - 1];
+      i++;
+      if (o is Exception) throw o;
+      return o as http.Response;
+    });
+  }
+
+  test('a 503 costs ONE request, the event stays buffered, the next flush delivers it', () async {
+    script([http.Response('', 503)]);
+    final m = makeMonitor();
+    m.event('boom', const MonitorEventOptions(ok: true));
+    await m.flush();
+
+    expect(bodies.length, 1,
+        reason: 'a 503 must cost exactly ONE request — no in-flight retry loop');
+    // The killer regression: the old code discarded the Response, so a 503 was
+    // indistinguishable from success and destroyed the batch. It must survive.
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    expect(allEvents().map((e) => e['featureName']), contains('boom'));
+  });
+
+  // The load property this change exists for: an outage must cost the backend
+  // the SAME number of requests as healthy operation. The old 3-attempt loop
+  // turned N flushes into 3N at the exact moment it could least be afforded.
+  test('an outage over N flushes produces exactly N requests, never 3N', () async {
+    script([http.Response('', 503)]);
+    final m = makeMonitor();
+    m.event('boom', const MonitorEventOptions(ok: true));
+
+    for (var i = 0; i < 5; i++) {
+      await m.flush();
+    }
+
+    expect(bodies.length, 5, reason: '5 flushes must be 5 requests, not 15');
+  });
+
+  test('400 is NOT retried — a bad request will not fix itself', () async {
+    script([http.Response('', 400)]);
+    final m = makeMonitor();
+    m.event('x', const MonitorEventOptions(ok: true));
+    await m.flush();
+
+    expect(bodies.length, 1, reason: '4xx is terminal');
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    expect(bodies, isEmpty, reason: 'a terminally rejected batch is dropped, not re-queued');
+  });
+
+  test('a network error costs ONE request and re-queues', () async {
+    script([Exception('connection refused')]);
+    final m = makeMonitor();
+    m.event('x', const MonitorEventOptions(ok: true));
+    await m.flush();
+    expect(bodies.length, 1, reason: 'a network failure costs ONE request, not three');
+
+    // ...and the next flush actually delivers it.
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    expect(allEvents().map((e) => e['featureName']), contains('x'));
+  });
+
+  test('429 stops the loop and holds off the next flush via Retry-After', () async {
+    script([http.Response('', 429, headers: {'retry-after': '30'})]);
+    final m = makeMonitor();
+    m.event('x', const MonitorEventOptions(ok: true));
+    await m.flush();
+    expect(bodies.length, 1, reason: 'rate limiting must not be hammered');
+
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    expect(bodies, isEmpty, reason: 'still inside the Retry-After hold-off');
+  });
+
+  // REGRESSION: a 429 used to classify as `done`, so `_drain` skipped `_requeue`
+  // and the batch — already taken out of the buffer — was destroyed. The test
+  // above passes either way, because it only counts requests. THIS one asserts
+  // on the payload: the events the hold-off exists to protect must survive it.
+  // `retry-after: 0` arms no hold-off, so the next flush can prove re-delivery
+  // without any clock control.
+  test('re-queues the 429ed batch — the events are NOT lost', () async {
+    script([http.Response('', 429, headers: {'retry-after': '0'})]);
+    final m = makeMonitor();
+    // ok:true — an error event would trigger its own immediate auto-flush and
+    // make the request count ambiguous.
+    m.event('checkout', const MonitorEventOptions(ok: true));
+    await m.flush();
+    expect(bodies.length, 1, reason: 'rate limiting must not be retried in-loop');
+
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    expect(allEvents().map((e) => e['featureName']), contains('checkout'));
+  });
+
+  test('buffer does not grow past its cap under a sustained outage', () async {
+    script([http.Response('', 503)]);
+    final m = makeMonitor();
+    for (var i = 0; i < 200; i++) {
+      m.event('e$i', const MonitorEventOptions(ok: true));
+    }
+    await m.flush(); // fails → 200 events re-queued
+    for (var i = 0; i < 120; i++) {
+      m.event('late$i', const MonitorEventOptions(ok: true));
+    }
+    await m.flush(); // fails again
+
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    final delivered = allEvents();
+    expect(delivered.length, 200, reason: 'memory stays bounded at the cap');
+    // Newest events win: the freshest arrivals must have survived the trim.
+    expect(delivered.map((e) => e['featureName']), contains('late119'));
+  });
+
+  // A batch that waits out an outage must still report WHEN it happened. Without
+  // a client `ts` the backend falls back to ingest time (`_resolve_event_ts`), so
+  // an outage reads as calm during the failure and a phantom spike once it ENDS.
+  // Covers BOTH paths: a normal pushed event and a `feature_call_summary`.
+  test('ts is stamped when the event happened, not when the batch is finally sent', () async {
+    script([http.Response('', 503)]);
+    final m = makeMonitor();
+
+    final happenedAt = DateTime.now().toUtc();
+    m.event('checkout', const MonitorEventOptions(ok: true));
+    m.trackFeatureCall('summarised');
+    await m.flush(); // fails — the batch is held
+
+    // The outage lasts. Real elapsed time, so the stamp is distinguishable.
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+
+    bodies.clear();
+    script([http.Response('', 204)]);
+    await m.flush();
+    final sentAt = DateTime.now().toUtc();
+
+    final delivered = allEvents();
+    expect(delivered.length, greaterThanOrEqualTo(2),
+        reason: 'the delayed batch must actually be delivered');
+
+    for (final e in delivered) {
+      final name = e['featureName'];
+      final raw = e['ts'] as String?;
+      expect(raw, isNotNull,
+          reason: 'event $name carries no ts — the backend would fall back to ingest time');
+      final parsed = DateTime.parse(raw!).toUtc();
+      expect(parsed.difference(happenedAt).inMilliseconds, lessThanOrEqualTo(100),
+          reason: 'ts for $name must be the event\'s own time, got $raw');
+      expect(sentAt.difference(parsed).inMilliseconds, greaterThanOrEqualTo(350),
+          reason: 'ts for $name must be clearly EARLIER than the send, got $raw');
+    }
+    expect(delivered.any((e) => e['source'] == 'feature_call_summary'), isTrue,
+        reason: 'the summary-drain path must be covered too');
+  });
+
+  // destroy() used to await _flushChain, which could hold a drain sitting in a
+  // retry backoff behind a timeout-less http client — no ceiling at all.
+  test('destroy stays inside its budget against a server that never responds', () async {
+    when(() => client.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+        .thenAnswer((_) async {
+      await Future<void>.delayed(const Duration(seconds: 60)); // never answers
+      return http.Response('', 204);
+    });
+    final m = makeMonitor();
+    m.event('x', const MonitorEventOptions(ok: true));
+
+    final sw = Stopwatch()..start();
+    await m.destroy();
+    sw.stop();
+
+    expect(sw.elapsed, lessThan(const Duration(seconds: 10)),
+        reason: 'teardown took ${sw.elapsed} — it must be bounded');
+  });
+
+  test('concurrent flushes are serialised — no double-send of a batch', () async {
+    script([http.Response('', 204)]);
+    final m = makeMonitor();
+    m.event('once', const MonitorEventOptions(ok: true));
+    await Future.wait([m.flush(), m.flush(), m.flush()]);
+
+    final sent = allEvents().where((e) => e['featureName'] == 'once');
+    expect(sent.length, 1, reason: 'overlapping drains must not interleave batches');
   });
 }
