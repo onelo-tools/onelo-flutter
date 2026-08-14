@@ -44,6 +44,12 @@ class OneloAuth extends ChangeNotifier {
   String? _pkceVerifier;
   String? _instanceId;
   bool _attestRequired = false;
+  /// Android Play Integrity: the developer's Google Cloud project NUMBER
+  /// (`/api/sdk/config`'s `cloud_project_number`), sourced from the Play
+  /// Integrity credential uploaded in the Onelo dashboard. Required by the
+  /// Standard Integrity API's `setCloudProjectNumber`; null when unconfigured
+  /// (Play Integrity is then skipped). Ignored on iOS.
+  int? _cloudProjectNumber;
   List<String> _oauthProviders = [];
 
   /// iOS App Attest manager. Owned by [Onelo], set here after construction so
@@ -135,6 +141,14 @@ class OneloAuth extends ChangeNotifier {
       // Late-bound: reads the attest manager (set by Onelo after construction),
       // so the SSE connect carries X-Attest-Token once attestation completes.
       getAttestToken: _attestTokenValue,
+      getIntegrityToken: _integrityTokenValue,
+      // The SSE reconnect loop is a long-lived, indefinitely-retrying request
+      // path — without self-heal wired here, a stale cached Play Integrity
+      // token (backend registration changed underneath it) makes it retry
+      // FOREVER on capped backoff, presenting the SAME stale credential every
+      // time (found via a live device test: continuous bundle_id_mismatch on
+      // every reconnect attempt, never recovering).
+      maybeSelfHeal: (json) => attest?.maybeSelfHealFromError(json),
     );
     // Realtime remote-logout: the backend fans `session.revoked` to ALL
     // subscribers of the app, so filter by `app_user_id` — a missing target is
@@ -190,7 +204,7 @@ class OneloAuth extends ChangeNotifier {
       // detached Task): on iOS it normally completes in ~1s. No-op off iOS.
       if (_attestRequired) {
         final a = attest;
-        if (a != null) unawaited(a.attestIfNeeded());
+        if (a != null) unawaited(a.attestIfNeeded(cloudProjectNumber: _cloudProjectNumber));
         // #25 — /auth/initiate is attestation-gated, so fetch the hosted URL only
         // AFTER the token lands (via _fetchInitiate's awaitReady). Fetching it
         // tokenless here would 403 and leave hostedUrl null → the auth view sticks
@@ -559,6 +573,8 @@ class OneloAuth extends ChangeNotifier {
         // (mirrors Swift `ResolvedConfig.attestRequired`). Drives the background
         // attestation kicked off in [initialize].
         _attestRequired = (data['attest_required'] as bool?) ?? false;
+        final cpn = data['cloud_project_number'];
+        _cloudProjectNumber = (cpn is num && cpn > 0) ? cpn.toInt() : null;
         // #36 — branding page background (checkout_bg_color). Cache it so the
         // next cold start can paint the branded auto-login splash immediately.
         if (data['checkout_bg_color'] is String) {
@@ -596,6 +612,36 @@ class OneloAuth extends ChangeNotifier {
 
   // ── Standard headers + per-install instance id ────────────────────────
 
+  /// Which OS this build is running on — `ios`, `android`, `macos`, `windows`,
+  /// `linux`, `web`, or `unknown`.
+  ///
+  /// One Flutter codebase targets all of them, so the SDK name says nothing
+  /// about the store an app ships through — and App Review guideline 3.1.1
+  /// governs Apple's only. `/api/sdk/config` reads this to decide whether the
+  /// "Require plan on sign-up" gate applies (applications.paywall_gate_on_apple).
+  /// Without it a Flutter developer could set "sign-in only on Apple" in the
+  /// dashboard and have it silently do nothing on their iOS build.
+  ///
+  /// Uses `defaultTargetPlatform` rather than `dart:io` so the same code path
+  /// works on Flutter Web, where `Platform` is unavailable.
+  static String _currentOS() {
+    if (kIsWeb) return 'web';
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.iOS:
+        return 'ios';
+      case TargetPlatform.android:
+        return 'android';
+      case TargetPlatform.macOS:
+        return 'macos';
+      case TargetPlatform.windows:
+        return 'windows';
+      case TargetPlatform.linux:
+        return 'linux';
+      default:
+        return 'unknown';
+    }
+  }
+
   /// Standard headers on every SDK request (mirrors Swift `addStandardHeaders`):
   /// SDK-version telemetry + a stable per-install instance id, plus optional JSON
   /// content-type, `X-Publishable-Key`, and Bearer token.
@@ -607,6 +653,7 @@ class OneloAuth extends ChangeNotifier {
     final headers = <String, String>{
       'X-Sdk-Version': oneloFlutterSdkVersion,
       'X-Onelo-Instance-Id': await _instanceIdValue(),
+      'X-Onelo-OS': _currentOS(),
     };
     // X-Bundle-Id on every request — the backend security gate 403s a live
     // mobile app with registered bundle ids without it (e.g. GET /auth/initiate).
@@ -617,6 +664,14 @@ class OneloAuth extends ChangeNotifier {
     // omitted off iOS or before attestation completes.
     final at = await _attestTokenValue();
     if (at != null && at.isNotEmpty) headers['X-Attest-Token'] = at;
+    // X-Integrity-Token (Android Play Integrity) — Android twin of the block
+    // above. Missing this doesn't hard-403 today (the backend's cross-platform
+    // guard degrades react_native/flutter to monitor-mode without a token),
+    // but it means auth's own requests (initiate/signin/signup/refresh/
+    // hosted-callback) never actually prove per-request integrity even once
+    // the exchange has produced a token — only client.dart/monitor/etc had it.
+    final it = await _integrityTokenValue();
+    if (it != null && it.isNotEmpty) headers['X-Integrity-Token'] = it;
     if (json) headers['Content-Type'] = 'application/json';
     if (publishableKeyHeader) headers['X-Publishable-Key'] = _config.publishableKey;
     if (bearer != null) headers['Authorization'] = 'Bearer $bearer';
@@ -631,6 +686,18 @@ class OneloAuth extends ChangeNotifier {
     if (a == null) return null;
     try {
       return await a.headerToken();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Android twin of [_attestTokenValue] — non-blocking read of the cached
+  /// Play Integrity token from the (late-bound) [attest] manager.
+  Future<String?> _integrityTokenValue() async {
+    final a = attest;
+    if (a == null) return null;
+    try {
+      return await a.integrityHeaderToken();
     } catch (_) {
       return null;
     }
@@ -731,6 +798,15 @@ class OneloAuth extends ChangeNotifier {
       // otherwise leave hostedUrl null → the view hangs forever on the skeleton.
       // Log it + set an error the view surfaces as "Try again" (parity with RN).
       debugPrint('[OneloAuth] hosted sign-in unavailable: HTTP ${response.statusCode} — ${response.body}');
+      // A stale, still-"valid" cached attest/integrity token can silently
+      // drift from a backend registration that changed underneath it (bundle
+      // unregistered/re-registered, cert rotated) — the cache doesn't expire
+      // for up to 30 days. /auth/initiate is the first attestation-gated
+      // request on every cold start, so checking here catches the drift as
+      // early as possible (parity with the RN SDK's `_flowInit`).
+      try {
+        attest?.maybeSelfHealFromError(jsonDecode(response.body));
+      } catch (_) {}
       _initiateError = (response.statusCode >= 500 || response.statusCode == 429)
           ? 'Sign-in is temporarily unavailable. Please try again.'
           : "Couldn't start sign-in. Please try again.";

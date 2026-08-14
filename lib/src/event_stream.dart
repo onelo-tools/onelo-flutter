@@ -30,13 +30,17 @@ class OneloEventStream {
     String? environment,
     Future<String?> Function()? getBundleId,
     Future<String?> Function()? getAttestToken,
+    Future<String?> Function()? getIntegrityToken,
+    void Function(dynamic json)? maybeSelfHeal,
   })  : _client = client,
         _apiUrl = apiUrl,
         _publishableKey = publishableKey,
         _instanceId = instanceId,
         _environment = environment,
         _getBundleId = getBundleId,
-        _getAttestToken = getAttestToken;
+        _getAttestToken = getAttestToken,
+        _getIntegrityToken = getIntegrityToken,
+        _maybeSelfHeal = maybeSelfHeal;
 
   final http.Client _client;
   final String _apiUrl;
@@ -53,6 +57,24 @@ class OneloEventStream {
   /// without it → the stream would reconnect-loop and realtime would be dead.
   /// Non-blocking; null / omitted off iOS.
   final Future<String?> Function()? _getAttestToken;
+  /// Android twin of [_getAttestToken] — cached Play Integrity JWT sent as
+  /// `X-Integrity-Token` on the SSE connect.
+  final Future<String?> Function()? _getIntegrityToken;
+
+  /// Self-heal hook: called with the connect rejection's body so a HARD
+  /// attest/integrity reject (bundle_id_mismatch, attest_key_revoked, …) drops
+  /// the stale cached credential and re-attests. Wired to
+  /// OneloAttest.maybeSelfHealFromError.
+  ///
+  /// Without this, a stream that never connects (a stale cached Play Integrity
+  /// token after the backend registration changed underneath it — see the
+  /// android/ios self-heal doc in attest.dart) retries FOREVER on capped
+  /// exponential backoff, presenting the SAME stale credential every time —
+  /// the very reconnect loop meant to recover instead perpetuates the outage
+  /// (found via a live device test: `bundle_id_mismatch` on every SSE connect
+  /// attempt, indefinitely, because this was the only Flutter request path
+  /// that swallowed the rejection body without ever offering it to self-heal).
+  final void Function(dynamic json)? _maybeSelfHeal;
 
   final Map<String, OneloEventHandler> _handlers = {};
   String? _userId;
@@ -151,17 +173,27 @@ class OneloEventStream {
       // X-Attest-Token (iOS App Attest) on the SSE connect. Non-blocking; omitted
       // off iOS or before attestation completes.
       final attestToken = _getAttestToken != null ? await _getAttestToken!() : null;
+      // X-Integrity-Token (Android Play Integrity) — Android twin of attestToken.
+      final integrityToken = _getIntegrityToken != null ? await _getIntegrityToken!() : null;
       final request = http.Request('GET', uri)
         ..headers['Accept'] = 'text/event-stream'
         ..headers['X-Sdk-Version'] = oneloFlutterSdkVersion;
       if (bundleId != null && bundleId.isNotEmpty) request.headers['X-Bundle-Id'] = bundleId;
       if (attestToken != null && attestToken.isNotEmpty) request.headers['X-Attest-Token'] = attestToken;
+      if (integrityToken != null && integrityToken.isNotEmpty) request.headers['X-Integrity-Token'] = integrityToken;
       final response = await _client.send(request);
       // A newer open()/stop() won the race while we were connecting — abandon
       // this response so we don't leak a subscription the current generation
       // won't own (and won't ever cancel).
       if (gen != _generation) return;
       if (response.statusCode != 200) {
+        try {
+          final body = await response.stream.bytesToString();
+          _maybeSelfHeal?.call(jsonDecode(body));
+        } catch (_) {
+          // best-effort — a body we can't read/parse just skips self-heal,
+          // same as any other transport hiccup.
+        }
         _scheduleReconnect();
         return;
       }

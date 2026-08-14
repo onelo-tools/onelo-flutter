@@ -32,6 +32,11 @@ class OneloClient {
   /// feedback transports, which all route through [_headers] / [securityHeaders].
   final Future<String?> Function()? _getAttestToken;
 
+  /// Supplies the cached Android Play Integrity JWT sent as `X-Integrity-Token`
+  /// (wired to OneloAttest.integrityHeaderToken). Android twin of
+  /// [_getAttestToken] — same non-blocking, off-the-request-path contract.
+  final Future<String?> Function()? _getIntegrityToken;
+
   /// FAZA 3 — per-request App Attest assertion headers (method, path, query, body)
   /// → X-Attest-Key-Id/Assertion/Challenge, or null (no attested key / off iOS)
   /// → the bearer above still applies. Wired to OneloAttest.assertionHeaders. One
@@ -54,12 +59,14 @@ class OneloClient {
     Future<String> Function()? getInstanceId,
     Future<String?> Function()? getBundleId,
     Future<String?> Function()? getAttestToken,
+    Future<String?> Function()? getIntegrityToken,
     Future<Map<String, String>?> Function(String, String, String, String)? getAssertionHeaders,
     void Function(dynamic)? maybeSelfHeal,
     http.Client? httpClient,
   })  : _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
+        _getIntegrityToken = getIntegrityToken,
         _getAssertionHeaders = getAssertionHeaders,
         _maybeSelfHeal = maybeSelfHeal,
         _httpClient = httpClient ?? http.Client();
@@ -108,6 +115,15 @@ class OneloClient {
         if (at != null && at.isNotEmpty) h['X-Attest-Token'] = at;
       } catch (_) {}
     }
+    // X-Integrity-Token (Android Play Integrity) — Android twin of the block
+    // above, non-blocking, sent only once the exchange has produced a token.
+    final getIntegrity = _getIntegrityToken;
+    if (getIntegrity != null) {
+      try {
+        final it = await getIntegrity();
+        if (it != null && it.isNotEmpty) h['X-Integrity-Token'] = it;
+      } catch (_) {}
+    }
     return h;
   }
 
@@ -153,7 +169,18 @@ class OneloClient {
     if (featureEnvironment != null) params['environment'] = featureEnvironment!;
     final uri = Uri.parse('$apiUrl/api/sdk/features/poll').replace(queryParameters: params);
     final response = await _httpClient.get(uri, headers: await _headers());
-    if (response.statusCode != 200) return {};
+    if (response.statusCode != 200) {
+      // Feature polling is a long-lived, indefinitely-repeating loop — without
+      // this, a stale cached attest/integrity credential would keep 403ing on
+      // every single poll forever instead of self-healing once (same class of
+      // gap fixed in the SSE reconnect loop — see event_stream.dart).
+      if (response.body.isNotEmpty) {
+        try {
+          _maybeSelfHeal?.call(jsonDecode(response.body));
+        } catch (_) {}
+      }
+      return {};
+    }
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 

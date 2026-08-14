@@ -162,6 +162,9 @@ class OneloMonitor {
   /// `validate_sdk_request_security` requires it on live mobile ingest. Non-blocking;
   /// null / omitted off iOS.
   final Future<String?> Function()? _getAttestToken;
+  /// Android twin of [_getAttestToken] — cached Play Integrity JWT sent as
+  /// `X-Integrity-Token` on monitor ingest. Wired to OneloAttest.integrityHeaderToken.
+  final Future<String?> Function()? _getIntegrityToken;
   final FlutterSecureStorage _storage;
 
   late final http.Client _httpClient;
@@ -248,6 +251,7 @@ class OneloMonitor {
     String? bundleId,
     Future<String?> Function()? getBundleId,
     Future<String?> Function()? getAttestToken,
+    Future<String?> Function()? getIntegrityToken,
     http.Client? httpClient,
     FlutterSecureStorage? secureStorage,
   })  : _environment = environment,
@@ -255,6 +259,7 @@ class OneloMonitor {
         _bundleId = bundleId,
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
+        _getIntegrityToken = getIntegrityToken,
         _storage = secureStorage ?? const FlutterSecureStorage() {
     _httpClient = httpClient ?? http.Client();
     _flushTimer = Timer.periodic(const Duration(seconds: 15), (_) => flush());
@@ -755,6 +760,15 @@ class OneloMonitor {
       try {
         final at = await getAttest();
         if (at != null && at.isNotEmpty) h['X-Attest-Token'] = at;
+      } catch (_) {}
+    }
+    // X-Integrity-Token (Android Play Integrity) — Android twin of the block
+    // above.
+    final getIntegrity = _getIntegrityToken;
+    if (getIntegrity != null) {
+      try {
+        final it = await getIntegrity();
+        if (it != null && it.isNotEmpty) h['X-Integrity-Token'] = it;
       } catch (_) {}
     }
     return h;

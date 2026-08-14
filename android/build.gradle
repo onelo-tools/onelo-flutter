@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// Gradle requires `plugins {}` to be the FIRST block in the file (only
+// `pluginManagement {}` may precede it) — `group`/`version` must come AFTER,
+// not before. Putting them above `plugins {}` breaks the build for every
+// consumer with "only buildscript {} and other plugins {} script blocks are
+// allowed before plugins {} blocks" (caught during real on-device testing).
+group 'com.onelo.flutter'
+version '1.0'
+
+// Android half of the `OneloPlugin` federated plugin. iOS owns App Attest
+// (../ios/Classes/OneloPlugin.swift); this owns Play Integrity — same
+// MethodChannel name (`onelo/attest`) so `lib/src/attest.dart` talks to one
+// channel on both platforms and branches on which methods each side exposes.
+// Versions (AGP / Kotlin) are resolved from the host Flutter app's root
+// project, per the standard federated-plugin convention — no buildscript
+// block here, so this never fights the app's own plugin resolution.
+android {
+    namespace 'com.onelo.flutter'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 24
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    implementation 'com.google.android.play:integrity:1.6.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3'
+}

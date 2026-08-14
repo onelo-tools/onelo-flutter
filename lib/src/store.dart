@@ -53,6 +53,10 @@ class OneloStore {
   /// OneloAttest.headerToken). Non-blocking; null / omitted off iOS.
   final Future<String?> Function()? _getAttestToken;
 
+  /// Android twin of [_getAttestToken] — cached Play Integrity JWT sent as
+  /// `X-Integrity-Token`. Wired to OneloAttest.integrityHeaderToken.
+  final Future<String?> Function()? _getIntegrityToken;
+
   final http.Client _httpClient;
 
   /// Fires when the external-browser card checkout returns via the OS deep-link
@@ -69,6 +73,7 @@ class OneloStore {
     Future<String> Function()? getInstanceId,
     Future<String?> Function()? getBundleId,
     Future<String?> Function()? getAttestToken,
+    Future<String?> Function()? getIntegrityToken,
     http.Client? httpClient,
   })  : _apiUrl = apiUrl,
         _publishableKey = publishableKey,
@@ -78,6 +83,7 @@ class OneloStore {
         _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
+        _getIntegrityToken = getIntegrityToken,
         _httpClient = httpClient ?? http.Client();
 
   /// Common security headers for the gated initiate endpoints: SDK version, the
@@ -110,6 +116,15 @@ class OneloStore {
       try {
         final at = await getAttest();
         if (at != null && at.isNotEmpty) headers['X-Attest-Token'] = at;
+      } catch (_) {}
+    }
+    // X-Integrity-Token (Android Play Integrity) — Android twin of the block
+    // above.
+    final getIntegrity = _getIntegrityToken;
+    if (getIntegrity != null) {
+      try {
+        final it = await getIntegrity();
+        if (it != null && it.isNotEmpty) headers['X-Integrity-Token'] = it;
       } catch (_) {}
     }
     return headers;

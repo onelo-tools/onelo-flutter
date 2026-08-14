@@ -172,6 +172,7 @@ class Onelo {
       getBundleId: auth.bundleId,
       // X-Attest-Token on every client request (features/forms/waitlist/paywall/feedback).
       getAttestToken: attest.headerToken,
+      getIntegrityToken: attest.integrityHeaderToken,
       // FAZA 3 — per-request assertion + self-heal (adapter: client wants a
       // positional fn; assertionHeaders takes named args).
       getAssertionHeaders: (m, path, q, b) =>
@@ -186,6 +187,7 @@ class Onelo {
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
       getAttestToken: attest.headerToken,
+      getIntegrityToken: attest.integrityHeaderToken,
       httpClient: httpClient,
     );
     // Install unhandled-error capture at init (parity with Swift, which installs
@@ -218,6 +220,7 @@ class Onelo {
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
       getAttestToken: attest.headerToken,
+      getIntegrityToken: attest.integrityHeaderToken,
       httpClient: httpClient,
     );
     store = OneloStore(
@@ -229,6 +232,7 @@ class Onelo {
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
       getAttestToken: attest.headerToken,
+      getIntegrityToken: attest.integrityHeaderToken,
       httpClient: httpClient,
     );
     consent = OneloConsent(
@@ -237,6 +241,7 @@ class Onelo {
       auth: auth,
       getBundleId: auth.bundleId,
       getAttestToken: attest.headerToken,
+      getIntegrityToken: attest.integrityHeaderToken,
       httpClient: httpClient,
     );
 
