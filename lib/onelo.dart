@@ -9,6 +9,7 @@ import 'src/attest.dart';
 import 'src/auth.dart';
 import 'src/client.dart';
 import 'src/types.dart';
+import 'src/http_client.dart';
 import 'src/features.dart';
 import 'src/monitor.dart';
 import 'src/paywall.dart';
@@ -74,6 +75,11 @@ class Onelo {
     bool autoLifecycleRefresh = true,
     http.Client? httpClient,
   }) {
+    // Every request below carries credentials (access token, publishable key,
+    // attestation token). Plaintext http would expose them to anyone on the same
+    // network, and this was previously unvalidated. See requireSecureApiUrl —
+    // localhost / 10.0.2.2 stay allowed for local development.
+    requireSecureApiUrl(apiUrl);
     final config = OneloConfig(
       publishableKey: publishableKey,
       apiUrl: apiUrl,
@@ -305,6 +311,20 @@ class Onelo {
         if (uri.scheme.toLowerCase() != scheme || uri.host != 'callback') return;
         final source = uri.queryParameters['source'];
         final code = uri.queryParameters['code'];
+        // An Access Gate REFUSAL, checked before anything else: it carries no
+        // code, so every branch below would ignore it and the link would die
+        // here in silence. The app then waits on "Check your inbox" forever
+        // while the browser shows the real answer — the exact failure fixed in
+        // Swift on 2026-08-19. `auth` validates the URL's origin and decides
+        // whether to accept it; this listener only routes.
+        if (uri.queryParameters['gate'] != null) {
+          // ignore: discarded_futures
+          auth.handleGateDeepLink(uri).catchError((Object e) {
+            debugPrint('[Onelo] gate deep-link failed: $e');
+            return false;
+          });
+          return;
+        }
         if (source == 'portal') {
           // ignore: discarded_futures
           customerPortal.completeExternalReturn(uri).catchError((Object e) {

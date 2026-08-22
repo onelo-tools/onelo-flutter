@@ -13,15 +13,49 @@ import 'auth.dart';
 /// nav is treated as a foreign host and shunted to the external browser, losing
 /// the code. Returns `isCallback` (so a code-less callback, e.g. cancel, is still
 /// swallowed rather than launched) and the `code` when present.
-({bool isCallback, String? code}) parseAuthCallback(String url, String callbackScheme) {
+/// [expired] is true when the page handed control back saying the addressing
+/// token is spent (`?error=invalid_token|expired_token|token_expired`). That is
+/// what "Use a different account" on the no-plan page sends after signing the
+/// user out, and what an idle expiry sends. Before 1.33.0 this was indistinguishable
+/// from a plain cancel: the navigation was prevented and NOTHING else happened,
+/// so the WebView sat frozen on a dead page forever. Mirrors Swift's
+/// `onSessionExpired` (OneloAuthView.swift) — the correct response is to
+/// re-resolve a FRESH hosted URL, which now answers `sign_in`.
+/// Does closing THIS surface have to sign the user out?
+///
+/// The backend stamps `exit=signout` on a store or no-plan URL it hands out
+/// because the user only reached it by authenticating with NO plan — so the
+/// screen behind it is sign-in, not the app. Re-resolving without dropping the
+/// session sends the same Bearer back, the backend answers "signed in, no plan"
+/// and returns THE SAME SCREEN: it closes and instantly reopens, which reads as
+/// nothing happening at all (found in the JS SDK on 2026-08-19).
+///
+/// A store opened by an ENTITLED user carries no marker and closes back into the
+/// app — signing that person out for declining to buy would be hostile.
+bool closingMeansSignOut(String? url) {
+  if (url == null) return false;
+  final uri = Uri.tryParse(url);
+  if (uri == null) return false;
+  return uri.queryParameters['exit'] == 'signout';
+}
+
+({bool isCallback, String? code, bool expired}) parseAuthCallback(
+    String url, String callbackScheme) {
   final uri = Uri.tryParse(url);
   if (uri == null ||
       uri.scheme.toLowerCase() != callbackScheme.toLowerCase() ||
       uri.host != 'callback') {
-    return (isCallback: false, code: null);
+    return (isCallback: false, code: null, expired: false);
   }
   final code = uri.queryParameters['code'];
-  return (isCallback: true, code: (code != null && code.isNotEmpty) ? code : null);
+  final error = uri.queryParameters['error'];
+  return (
+    isCallback: true,
+    code: (code != null && code.isNotEmpty) ? code : null,
+    expired: error == 'invalid_token' ||
+        error == 'expired_token' ||
+        error == 'token_expired',
+  );
 }
 
 /// Pre-connect loading skeleton for the hosted SIGN-IN page, loaded into the
@@ -313,6 +347,35 @@ class _OneloAuthViewState extends State<OneloAuthView> {
               widget.auth.exchangeCode(callback.code!).catchError((Object e) {
                 debugPrint('[OneloAuthView] code exchange failed: $e');
               });
+            } else if (callback.expired) {
+              // Drop the LOCAL session first when the screen we are leaving was
+              // stamped `exit=signout`. Without it the re-resolve below sends the
+              // same session, the backend answers with the same screen, and the
+              // user watches it reopen — see closingMeansSignOut.
+              // The surface the flow resolved to. It carries the marker because
+              // /flow/init stamps it there; the WebView'''s own in-page
+              // navigations do not change it.
+              final wasSignOutSurface = closingMeansSignOut(widget.auth.hostedUrl);
+              if (wasSignOutSurface) {
+                // ignore: discarded_futures
+                widget.auth.signOut().catchError((Object e) {
+                  // Best-effort: a failed server revoke must not strand the user
+                  // on a dead screen. The local session is cleared either way.
+                  debugPrint('[OneloAuthView] sign-out before re-resolve failed: $e');
+                });
+              }
+              // The addressing token is spent (sign-out from the no-plan page,
+              // or an idle expiry). Without this the navigation was simply
+              // prevented and the WebView froze on a dead page. Re-resolve a
+              // FRESH hosted URL — /flow/init now answers `sign_in`, so the user
+              // lands on a clean form. Parity with Swift's onSessionExpired.
+              // ignore: discarded_futures
+              widget.auth.refreshHostedUrl().then((url) {
+                if (url != null && mounted) _controller?.loadRequest(Uri.parse(url));
+              }).catchError((Object e) {
+                debugPrint('[OneloAuthView] reload after expiry failed: $e');
+                return null;
+              });
             }
             return NavigationDecision.prevent;
           }
@@ -323,8 +386,13 @@ class _OneloAuthViewState extends State<OneloAuthView> {
           // swaps to the app.
           final provider = _providerFromUrl(req.url);
           if (provider != null) {
+            // Carry the intent off the URL we are intercepting. The hosted page
+            // put it there because it knows which button was pressed; dropping
+            // it turned every "Sign up with Google" into a sign-in and made
+            // social sign-up impossible (2026-08-19).
+            final intent = Uri.tryParse(req.url)?.queryParameters['intent'];
             // ignore: discarded_futures
-            widget.auth.signInWithOAuth(provider).then((_) {}).catchError((Object e) {
+            widget.auth.signInWithOAuth(provider, intent: intent).then((_) {}).catchError((Object e) {
               debugPrint('[OneloAuthView] OAuth failed: $e');
             });
             return NavigationDecision.prevent;
@@ -485,8 +553,19 @@ class _OneloAuthViewState extends State<OneloAuthView> {
       }
       return const Scaffold();
     }
-    // Signed in — show the app
-    if (widget.auth.currentSession != null) {
+    // Signed in AND entitled — show the app.
+    //
+    // This used to be `currentSession != null`, which gave the app away: a user
+    // with no plan signed in and walked straight in. The session says WHO they
+    // are and nothing about whether they may be here. `isAllowedIn` adds the
+    // entitlement half (and the `isReady` term that stops a cold start failing
+    // open before `/api/sdk/config` has said whether a plan is required at all).
+    //
+    // A signed-in user who is NOT allowed in falls through to the hosted WebView
+    // below, where `/flow/init` has routed them to the store or to the honest
+    // "No active plan" surface. That is the whole point: they must land on a
+    // real explanation, not on your app.
+    if (widget.auth.isAllowedIn) {
       return widget.child;
     }
     // #30 — the hosted sign-in URL couldn't be fetched (e.g. a permanent 403 from

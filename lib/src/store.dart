@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'version.dart';
 
 /// Onelo hosted Store (plans / checkout) flow.
@@ -84,7 +85,7 @@ class OneloStore {
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
         _getIntegrityToken = getIntegrityToken,
-        _httpClient = httpClient ?? http.Client();
+        _httpClient = httpClient ?? OneloHttpClient();
 
   /// Common security headers for the gated initiate endpoints: SDK version, the
   /// buyer's bearer token (when signed in), the per-install instance id, and the
@@ -202,6 +203,7 @@ class OneloStore {
     if (response.statusCode != 200) {
       throw OneloStoreInitiateException(
         'store-initiate returned ${response.statusCode}: ${response.body}',
+        code: _extractErrorCode(response.body),
       );
     }
 
@@ -261,6 +263,7 @@ class OneloStore {
     if (response.statusCode != 200) {
       throw OneloStoreInitiateException(
         'upgrade-initiate returned ${response.statusCode}: ${response.body}',
+        code: _extractErrorCode(response.body),
       );
     }
 
@@ -280,13 +283,48 @@ class OneloStore {
 
     return upgradeUrl;
   }
+
+  /// Machine-readable error code from an error body, or null.
+  ///
+  /// FastAPI wraps a dict `detail` as `{"detail": {"error": …}}`, hand-rolled
+  /// handlers return a flat `{"error": …}`, and `HTTPException(detail="…")` yields
+  /// a plain string — all three reach the SDK, so read them in that order.
+  static String? _extractErrorCode(String body) {
+    try {
+      final data = jsonDecode(body);
+      if (data is! Map) return null;
+      final flat = data['error'];
+      if (flat is String) return flat;
+      final detail = data['detail'];
+      if (detail is Map && detail['error'] is String) {
+        return detail['error'] as String;
+      }
+      if (detail is String) return detail;
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
 /// Thrown when the store-initiate request fails (network or server error).
 class OneloStoreInitiateException implements Exception {
   final String message;
-  const OneloStoreInitiateException(this.message);
+
+  /// Backend error code when the response carried one, e.g.
+  /// `in_app_store_not_allowed` (409 — the tenant's Access Gate hides the in-app
+  /// store because the app ships through an Apple store, guideline 3.1.1).
+  /// Null for network failures and unparsable bodies; unknown codes pass through
+  /// verbatim so a new backend code never breaks the SDK.
+  final String? code;
+
+  const OneloStoreInitiateException(this.message, {this.code});
+
+  /// True when the store is unavailable because of the Apple in-app store gate.
+  bool get isInAppStoreNotAllowed => code == 'in_app_store_not_allowed';
 
   @override
-  String toString() => 'OneloStoreInitiateException: $message';
+  String toString() => code == null
+      ? 'OneloStoreInitiateException: $message'
+      : 'OneloStoreInitiateException($code): $message';
 }

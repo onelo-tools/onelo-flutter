@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'version.dart';
 
 /// Initiates the Onelo Customer Portal session.
@@ -72,7 +73,7 @@ class OneloCustomerPortal {
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
         _getIntegrityToken = getIntegrityToken,
-        _httpClient = httpClient ?? http.Client();
+        _httpClient = httpClient ?? OneloHttpClient();
 
   /// The deep-link callback scheme this SDK uses (e.g. `myapp`).
   /// Exposed so [OneloCustomerPortalView] can read it without depending on

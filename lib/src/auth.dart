@@ -5,6 +5,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'attest.dart';
@@ -24,6 +25,24 @@ class OneloAuth extends ChangeNotifier {
   bool _isUserRevoked = false;
   int _consentRevision = 0;
   bool _allowCustomBranding = false;
+
+  /// Whether this app gates access behind a plan (`applications.paywall_enabled`,
+  /// from `/api/sdk/config`). Until 1.x this SDK never read it, which is why
+  /// [isAllowedIn] could not exist and `OneloAuthView` let ANY signed-in user
+  /// into the app — including one with no plan at all.
+  ///
+  /// **Tri-state on purpose.** `null` = never successfully resolved. A plain
+  /// `false` default fails OPEN, and not in a narrow window: config failures are
+  /// swallowed (`_registerPkceChallenge` catches everything) while `initialize()`
+  /// sets `_isReady = true` in a `finally`. So an offline cold start, a 403 from
+  /// attestation, or a 500 all produced "ready + no paywall" and waved a
+  /// plan-less user straight into a paid app — the exact bug [isAllowedIn]
+  /// exists to close. Unknown must therefore deny.
+  ///
+  /// Cached to secure storage so the SECOND launch onwards knows the answer even
+  /// offline (same idiom as `onelo_checkout_bg_color`); only a first-ever launch
+  /// with no network is genuinely unknown, and sign-in is impossible there anyway.
+  bool? _paywallEnabled;
   String _hostedAppName = 'App';
   String? _hostedAppLogoUrl;
   String? _hostedUrl;
@@ -82,6 +101,118 @@ class OneloAuth extends ChangeNotifier {
   bool get hasActiveAccess =>
       _currentSession?.user.entitlement == OneloEntitlement.active;
 
+  /// Whether this app requires a plan. From `/api/sdk/config`. Reports `false`
+  /// while still unknown — read [isAllowedIn] for the gating decision, which
+  /// treats unknown as "deny".
+  bool get paywallEnabled => _paywallEnabled ?? false;
+
+  /// **Should this user see your app?** The ONE signal to gate your UI on.
+  ///
+  /// `isReady && signed in && (no paywall || has paid access)`.
+  ///
+  /// Gating on `currentSession != null` instead is a paid-product giveaway, and
+  /// it is what `OneloAuthView` did until this version: a user with no plan
+  /// signed in and walked straight into the app. The session says *who* they
+  /// are; it says nothing about whether they may be here.
+  ///
+  /// Two terms exist to stop this failing OPEN, and both are load-bearing:
+  ///
+  /// * `isReady` covers the sub-second window before `/api/sdk/config` answers.
+  /// * `_paywallEnabled == false` (NOT `!paywallEnabled`) covers the case that
+  ///   actually bites: config never resolved at all. Failures there are
+  ///   swallowed while `initialize()` still sets `_isReady` in a `finally`, so
+  ///   an offline start or a 403 would otherwise look exactly like "this app has
+  ///   no paywall". Unknown denies; see [_paywallEnabled] for the cache that
+  ///   keeps a legitimate offline user of a non-paywall app from being caught.
+  ///
+  /// Mirrors Swift `isAllowedIn` (which shares the sub-second guard but not yet
+  /// the tri-state).
+  /// **Should this user see your app?** The ONE signal to gate your UI on.
+  ///
+  /// Reads the SERVER'S answer. The rule `!paywallEnabled || hasActiveAccess`
+  /// lived here, in the JS SDK and in Swift — three copies, each found wrong on
+  /// a different day. Onelo computes it once now and ships it with the user.
+  ///
+  /// `_isReady` and the session check stay local: they are facts about THIS
+  /// client, not policy. A stored session says who someone is; only the server
+  /// says whether they may be here.
+  bool get isAllowedIn {
+    if (!_isReady || _currentSession == null) return false;
+    final answer = _currentSession!.user.allowedIn;
+    if (answer != null) return answer;
+    // Older backend: no `allowed_in` in the payload. Falling back keeps an SDK
+    // released ahead of the server from locking every user out. COMPATIBILITY
+    // only — not a second source of truth — and it goes once the field is
+    // everywhere. Note `== false`: the tri-state means unknown must deny.
+    return _paywallEnabled == false || hasActiveAccess;
+  }
+
+  /// Origin (`https://host`) serving this app's hosted surfaces, as last named
+  /// by the backend. Persisted because a magic link can relaunch a killed
+  /// process: the deep link then arrives before anything has spoken to the
+  /// backend, and with no stored value there would be nothing to check against.
+  String? _hostedOrigin;
+
+  Future<void> _rememberHostedOrigin(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.scheme.toLowerCase() != 'https' || uri.host.isEmpty) return;
+    _hostedOrigin = uri.host.toLowerCase();
+    try {
+      await _storage.write(key: 'onelo_hosted_origin', value: _hostedOrigin);
+    } catch (e) {
+      // Never fail a sign-in over the anchor. Losing it only costs a fail-closed
+      // refusal on a later cold-start deep link, which re-resolves to sign-in.
+      debugPrint('[OneloAuth] could not persist hosted origin: $e');
+    }
+  }
+
+  /// Present the surface an Access Gate REFUSAL arrived with.
+  ///
+  /// A sign-in that finishes OUTSIDE the WebView — a magic link — can be turned
+  /// down by the gate, and then there is deliberately no code: the backend
+  /// withholds it rather than let the app decide. The refusal still has to reach
+  /// the app, or it is only ever visible in the browser tab the email opened
+  /// while the app waits on "Check your inbox" forever (Turingo/Swift,
+  /// 2026-08-19 — same contract, same failure).
+  ///
+  /// Nothing here reads or branches on the URL: WHICH screen it is, and what it
+  /// says, was settled server-side. Returns true when the surface was accepted.
+  ///
+  /// Fails CLOSED. This value arrives over a custom scheme, which ANY app on the
+  /// device can fire at us, and it goes on to be loaded in the app's own sign-in
+  /// window — so an unknown origin, a non-https URL, or no anchor at all are all
+  /// refused. A false negative costs one re-resolve back to sign-in; a false
+  /// positive renders an attacker's page inside the app.
+  Future<bool> handleGateDeepLink(Uri uri) async {
+    final raw = uri.queryParameters['gate'];
+    if (raw == null || raw.isEmpty) return false;
+    final gate = Uri.tryParse(raw);
+    if (gate == null || gate.scheme.toLowerCase() != 'https' || gate.host.isEmpty) return false;
+
+    _hostedOrigin ??= await _readStoredHostedOrigin();
+    if (_hostedOrigin == null || gate.host.toLowerCase() != _hostedOrigin) {
+      debugPrint('[OneloAuth] refused a gate URL from an unknown origin');
+      return false;
+    }
+
+    // Straight into `hostedUrl` rather than a parallel channel: OneloAuthView
+    // already reloads when this changes (its `_loadedUrl` comparison), and this
+    // is exactly the URL /flow/init would have handed over for the same user.
+    _hostedUrl = raw;
+    _initiateError = null;
+    notifyListeners();
+    return true;
+  }
+
+  Future<String?> _readStoredHostedOrigin() async {
+    try {
+      return await _storage.read(key: 'onelo_hosted_origin');
+    } catch (e) {
+      debugPrint('[OneloAuth] could not read hosted origin: $e');
+      return null;
+    }
+  }
+
   bool get allowCustomBranding => _allowCustomBranding;
   String get hostedAppName => _hostedAppName;
   String? get hostedAppLogoUrl => _hostedAppLogoUrl;
@@ -130,7 +261,7 @@ class OneloAuth extends ChangeNotifier {
     String? featureEnvironment,
   })  : _config = config,
         _storage = storage ?? const FlutterSecureStorage(),
-        _httpClient = httpClient ?? http.Client() {
+        _httpClient = httpClient ?? OneloHttpClient() {
     _eventStream = OneloEventStream(
       client: _httpClient,
       apiUrl: _config.apiUrl,
@@ -249,6 +380,11 @@ class OneloAuth extends ChangeNotifier {
           refreshToken.isNotEmpty;
       final cachedBg = await _storage.read(key: 'onelo_checkout_bg_color');
       if (cachedBg != null && cachedBg.isNotEmpty) _pageBackgroundColorHex = cachedBg;
+      // Last known paywall answer, so an offline relaunch gates correctly instead
+      // of denying a legitimate user of a non-paywall app. See [_paywallEnabled].
+      final cachedPaywall = await _storage.read(key: 'onelo_paywall_enabled');
+      if (cachedPaywall == '1') _paywallEnabled = true;
+      if (cachedPaywall == '0') _paywallEnabled = false;
     } catch (e) {
       // No platform channel (pure-Dart tests) → keep defaults; the view falls
       // back to the default branded background and a plain frame.
@@ -390,13 +526,21 @@ class OneloAuth extends ChangeNotifier {
       if (response.statusCode != 200) return session.user.entitlement;
       final data = jsonDecode(response.body) as Map<String, dynamic>;
       final entitlement = OneloEntitlement.parse(data['entitlement']);
-      if (entitlement != session.user.entitlement) {
+      // Refresh the SERVER'S ANSWER too, not just the ingredient. This call is
+      // what runs right after a purchase, and [isAllowedIn] now reads
+      // `allowedIn` — so updating only the entitlement would leave the stored
+      // answer saying "no" for someone who had just paid: locked out by the very
+      // refresh meant to let them in. Absent keeps the previous value.
+      final allowedIn =
+          data['allowed_in'] is bool ? data['allowed_in'] as bool : session.user.allowedIn;
+      if (entitlement != session.user.entitlement || allowedIn != session.user.allowedIn) {
         final user = OneloUser(
           id: session.user.id,
           email: session.user.email,
           role: session.user.role,
           tenantId: session.user.tenantId,
           entitlement: entitlement,
+          allowedIn: allowedIn,
         );
         _currentSession = OneloSession(
           accessToken: session.accessToken,
@@ -465,7 +609,20 @@ class OneloAuth extends ChangeNotifier {
   /// on Android) — providers reject embedded WebViews — captures the one-time
   /// `oac_` code from the `<scheme>://callback` deep link, and exchanges it for a
   /// session. Mirrors Swift's native OAuth. Throws on cancel / failure.
-  Future<OneloSession> signInWithOAuth(String provider) async {
+  /// [intent] — `'signup'` when the user pressed a SIGN-UP affordance, otherwise
+  /// a sign-in. CARRIED, never decided here: OAuth hands back a verified
+  /// identity and never an intention, so the backend cannot tell a first-time
+  /// sign-in from a sign-up unless it is told. It defaults to `signin`, which
+  /// refuses to create an account.
+  ///
+  /// The hosted page already knows which button was pressed and puts it on the
+  /// URL it navigates to. `OneloAuthView` intercepts that navigation to run
+  /// OAuth natively (providers refuse embedded WebViews) and used to DROP the
+  /// parameter while rebuilding the URL — so "Sign up with Google" reached the
+  /// backend as a sign-in, no account was created, and the user was told "This
+  /// account isn't registered" no matter which button they pressed (Adrian,
+  /// 2026-08-19). Nobody could create an account with a social provider at all.
+  Future<OneloSession> signInWithOAuth(String provider, {String? intent}) async {
     // The OAuth `oac_` code is bound to a PKCE challenge; exchangeCode later sends
     // the matching verifier. Ensure a verifier exists, then derive its challenge.
     if (_pkceVerifier == null) await _registerPkceChallenge();
@@ -480,6 +637,10 @@ class OneloAuth extends ChangeNotifier {
         'key': _config.publishableKey,
         'redirect_uri': redirectUri,
         'code_challenge': challenge,
+        // Only ever the two values the backend defines. Anything else — including
+        // a value smuggled onto an intercepted URL — falls back to the safe
+        // 'signin', which cannot create an account.
+        if (intent == 'signup') 'intent': 'signup',
       },
     );
     final initResponse = await _httpClient.get(initUri, headers: await _headers());
@@ -519,6 +680,15 @@ class OneloAuth extends ChangeNotifier {
 
   /// Sends a one-time magic-link sign-in email. Available on all plans.
   Future<void> sendMagicLink(String email, {String? redirectTo}) async {
+    // NOTE — no `code_challenge` here, deliberately (2026-08-18). Binding a PKCE
+    // challenge to a magic link is the right design and the backend supports it,
+    // but it cannot ship until the verifier is PERSISTED in a magic-link-specific
+    // slot the way Swift's `_beginFlowPKCE` does. `_pkceVerifier` is in-memory,
+    // is rotated on sign-out and REGENERATED on every `initialize()` — and a magic
+    // link is by definition opened later, usually after a relaunch. A challenge
+    // bound to a verifier that no longer exists makes /hosted-callback 401, and
+    // the token is already marked used at consume, so the user is locked out with
+    // no recovery. A challenge-less link is weaker; a burnt link is broken.
     final response = await _httpClient.post(
       Uri.parse('${_config.apiUrl}/api/sdk/auth/magic-link'),
       headers: await _headers(json: true),
@@ -569,6 +739,19 @@ class OneloAuth extends ChangeNotifier {
         // Capture metadata if available
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         _allowCustomBranding = (data['allow_custom_branding'] as bool?) ?? false;
+        // Feeds [isAllowedIn]. Absent means "no paywall" — an older backend that
+        // doesn't send the field behaves exactly as this SDK did before, so it
+        // cannot start locking users out of an app that never had a paywall.
+        // Reaching this line at all means config RESOLVED, which is what lifts
+        // the tri-state out of "unknown".
+        final paywall = (data['paywall_enabled'] as bool?) ?? false;
+        _paywallEnabled = paywall;
+        try {
+          await _storage.write(
+              key: 'onelo_paywall_enabled', value: paywall ? '1' : '0');
+        } catch (e) {
+          debugPrint('[OneloAuth] paywall flag cache failed: $e');
+        }
         // Whether the backend requires an iOS App Attest token on live requests
         // (mirrors Swift `ResolvedConfig.attestRequired`). Drives the background
         // attestation kicked off in [initialize].
@@ -772,11 +955,125 @@ class OneloAuth extends ChangeNotifier {
     return _hostedUrl;
   }
 
+  /// Resolve the next step. Asks `/api/sdk/flow/init` first and only falls back
+  /// to the legacy `/api/sdk/auth/initiate` when that endpoint genuinely isn't
+  /// there (404/405).
+  ///
+  /// ── Why this SDK had to stop calling /auth/initiate directly ─────────────
+  /// `/auth/initiate` answers exactly one question: "give me a sign-in page".
+  /// It cannot say "this user has no plan" or "send them to the store", because
+  /// those decisions need the caller's identity. So a Flutter app could only
+  /// ever show a sign-in form — and once the user signed in, nothing routed
+  /// them anywhere, which is how a plan-less user ended up inside the app.
+  ///
+  /// `/flow/init` makes that decision ONCE, server-side, for every SDK. It also
+  /// owns the App Store 3.1.1 gate: the store is withheld on Apple platforms
+  /// unless the developer opted in (Paywall → Access Gate). This SDK sends
+  /// `X-Onelo-OS` already, so simply asking the endpoint is what makes the gate
+  /// apply to Flutter at all — it did not before.
+  ///
+  /// Mirrors RN `_flowInit`/`_decisionFromFlow`, Swift `resolveFlow`, JS
+  /// `resolveFlow`. Deliberately the same shape: the routing rules must not have
+  /// a second, subtly different implementation per platform.
   Future<void> _fetchInitiate() async {
-    // #25 — /auth/initiate is attestation-gated. Wait for the token so the minted
-    // hostedUrl isn't a tokenless 403 (which would leave hostedUrl null and stick
-    // the auth view on its skeleton). No-op for non-attest apps.
+    // #25 — the gated request must not fire before App Attest has a token, or a
+    // cold start 403s and the view sticks on its skeleton. No-op without attest.
     if (_attestRequired) await attest?.awaitReady();
+
+    final flowStatus = await _tryFlowInit();
+    // 404/405 = this backend predates /flow/init. Anything else (including a
+    // real error, already surfaced by _tryFlowInit) must NOT silently retry on
+    // the legacy path — that would paper over a 403 with a sign-in form.
+    if (flowStatus == 404 || flowStatus == 405) {
+      debugPrint('[OneloAuth] /flow/init unavailable ($flowStatus) — using legacy /auth/initiate');
+      await _fetchInitiateLegacy();
+    }
+  }
+
+  /// Returns the HTTP status so [_fetchInitiate] can tell "endpoint absent" from
+  /// "endpoint said no". Sets [hostedUrl] / [initiateError] itself.
+  Future<int> _tryFlowInit() async {
+    final uri = Uri.parse('${_config.apiUrl}/api/sdk/flow/init').replace(
+      queryParameters: {
+        'key': _config.publishableKey,
+        'callback_scheme': _config.callbackScheme,
+      },
+    );
+    try {
+      // Bearer when signed in — without it the backend can only answer
+      // "sign_in", which is precisely the blindness this replaces.
+      final response = await _httpClient.get(
+        uri,
+        headers: await _headers(bearer: _currentSession?.accessToken),
+      );
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final action = data['action'] as String?;
+        if (action == 'authorized') {
+          // Backend confirms access. Reconcile the local entitlement so
+          // [isAllowedIn] agrees and the view reveals content; without this the
+          // gate could hold a user out that the server just let in.
+          _initiateError = null;
+          if (_paywallEnabled == true) await revalidateEntitlement();
+
+          // Only DROP the hosted URL once the gate actually opens. Clearing it
+          // unconditionally created a dead end: `revalidateEntitlement()` returns
+          // the CACHED entitlement on any non-200, so a 429/5xx on
+          // /api/sdk/auth/user left isAllowedIn false, hostedUrl null AND
+          // initiateError null — and the view has no branch for that. It rendered
+          // an empty WebView and sat on the skeleton forever, with no retry
+          // button and no recovery short of restarting the app.
+          if (isAllowedIn) {
+            _hostedUrl = null;
+          } else {
+            _initiateError = "Couldn't confirm your access. Please try again.";
+          }
+          return response.statusCode;
+        }
+        if (action == 'present' && data['url'] is String) {
+          _initiateError = null;
+          _hostedUrl = data['url'] as String;
+          // Remember WHERE Onelo hosts this app's surfaces. The backend just
+          // told us, so it is never assembled or assumed — and it is the only
+          // thing a deep-linked gate URL can be checked against before being
+          // loaded in the app's own WebView.
+          unawaited(_rememberHostedOrigin(_hostedUrl!));
+          _hostedAppName = (data['app_name'] as String?) ?? _hostedAppName;
+          _hostedAppLogoUrl = (data['app_logo_url'] as String?) ?? _hostedAppLogoUrl;
+          return response.statusCode;
+        }
+        // 2xx with a shape we don't understand is a contract break, not an
+        // absent endpoint — do not fall back to legacy on it.
+        debugPrint('[OneloAuth] invalid /flow/init response: ${response.body}');
+        _initiateError = "Couldn't start sign-in. Please try again.";
+        return response.statusCode;
+      }
+
+      if (response.statusCode == 404 || response.statusCode == 405) {
+        return response.statusCode;
+      }
+
+      // Surface the backend's own reason. A developer with a paywall on but no
+      // store configured (`store_not_configured`) needs to see WHY, not a bare
+      // status. Same reasoning as RN `_decisionFromFlow`.
+      debugPrint('[OneloAuth] /flow/init failed: HTTP ${response.statusCode} — ${response.body}');
+      try {
+        attest?.maybeSelfHealFromError(jsonDecode(response.body));
+      } catch (_) {}
+      _initiateError = (response.statusCode >= 500 || response.statusCode == 429)
+          ? 'Sign-in is temporarily unavailable. Please try again.'
+          : "Couldn't start sign-in. Please try again.";
+      return response.statusCode;
+    } catch (e) {
+      debugPrint('[OneloAuth] /flow/init error: $e');
+      _initiateError = 'Connection problem. Check your network and try again.';
+      // 0 = never reached the server. NOT a fallback trigger: retrying the
+      // legacy path over the same dead network would only fail again.
+      return 0;
+    }
+  }
+
+  Future<void> _fetchInitiateLegacy() async {
     final uri = Uri.parse('${_config.apiUrl}/api/sdk/auth/initiate').replace(
       queryParameters: {
         'key': _config.publishableKey,
@@ -951,6 +1248,9 @@ class OneloAuth extends ChangeNotifier {
         role: _parseRole(map['role'] as String? ?? 'member'),
         tenantId: map['tenant_id'] as String?,
         entitlement: OneloEntitlement.parse(map['entitlement']),
+        // Absent stays null — "the server did not say" and "the server said no"
+        // are different answers, and only the first may fall back.
+        allowedIn: map['allowed_in'] is bool ? map['allowed_in'] as bool : null,
       );
 
   OneloUserRole _parseRole(String role) {

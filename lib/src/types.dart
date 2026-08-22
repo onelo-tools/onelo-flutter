@@ -307,12 +307,24 @@ class OneloUser {
   /// Defaults to [OneloEntitlement.none].
   final OneloEntitlement entitlement;
 
+  /// **May this person see the app?** Computed by Onelo, never here.
+  ///
+  /// The rule — no paywall, or a live grant — used to be re-derived in every
+  /// SDK from two raw settings. Three languages, three copies, each found wrong
+  /// on a different day. The server now ships the conclusion
+  /// (`app/lib/access_gate.user_access_payload`).
+  ///
+  /// `null` means the backend did not send it (an older server), NOT "no". Only
+  /// then may the legacy derivation stand in — see [OneloAuth.isAllowedIn].
+  final bool? allowedIn;
+
   const OneloUser({
     required this.id,
     this.email,
     required this.role,
     this.tenantId,
     this.entitlement = OneloEntitlement.none,
+    this.allowedIn,
   });
 }
 

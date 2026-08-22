@@ -1,6 +1,6 @@
 name: onelo
 description: Official Flutter/Dart SDK for Onelo — feature flags, paywalls, forms, and waitlists.
-version: 1.32.0
+version: 1.37.1
 homepage: https://github.com/onelo-tools/onelo-flutter
 
 environment:

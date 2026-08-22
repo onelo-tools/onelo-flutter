@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'version.dart';
 
@@ -99,7 +100,7 @@ class OneloAttest {
     @visibleForTesting MethodChannel? channel,
   })  : _getInstanceId = getInstanceId,
         _storage = storage ?? const FlutterSecureStorage(),
-        _httpClient = httpClient ?? http.Client(),
+        _httpClient = httpClient ?? OneloHttpClient(),
         _channel = channel ?? _defaultChannel;
 
   /// True only on a real iOS runtime. Uses [defaultTargetPlatform] (not

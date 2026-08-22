@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'types.dart';
 import 'version.dart';
 
@@ -69,7 +70,7 @@ class OneloClient {
         _getIntegrityToken = getIntegrityToken,
         _getAssertionHeaders = getAssertionHeaders,
         _maybeSelfHeal = maybeSelfHeal,
-        _httpClient = httpClient ?? http.Client();
+        _httpClient = httpClient ?? OneloHttpClient();
 
   Map<String, String> get sdkHeaders => {
     // SDK-version telemetry on every client-based call (features, paywall, forms,

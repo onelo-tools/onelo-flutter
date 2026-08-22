@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'auth.dart';
 
 /// Legal-consent enforcement level. `block` gates the app until accepted;
@@ -150,7 +151,7 @@ class OneloConsent extends ChangeNotifier {
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
         _getIntegrityToken = getIntegrityToken,
-        _httpClient = httpClient ?? http.Client() {
+        _httpClient = httpClient ?? OneloHttpClient() {
     _lastConsentRevision = _auth.consentRevision;
     _lastSignedIn = _auth.currentSession != null;
     _auth.addListener(_onAuthChanged);

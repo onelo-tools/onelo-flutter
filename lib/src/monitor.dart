@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'http_client.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:device_info_plus/device_info_plus.dart';
@@ -261,7 +262,7 @@ class OneloMonitor {
         _getAttestToken = getAttestToken,
         _getIntegrityToken = getIntegrityToken,
         _storage = secureStorage ?? const FlutterSecureStorage() {
-    _httpClient = httpClient ?? http.Client();
+    _httpClient = httpClient ?? OneloHttpClient();
     _flushTimer = Timer.periodic(const Duration(seconds: 15), (_) => flush());
     // Best-effort async enrichment sources — never block or throw into the app.
     _loadSessionId();

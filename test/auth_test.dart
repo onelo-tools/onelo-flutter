@@ -144,7 +144,11 @@ OneloConfig _config() => const OneloConfig(
 /// fabricated top-level tokens + a unix `expires_at` the backend never sends,
 /// which is exactly why every auth flow crashed against staging while tests
 /// stayed green.
-Map<String, dynamic> _sessionResponse({String userId = 'user-abc', String? entitlement}) => {
+Map<String, dynamic> _sessionResponse({
+  String userId = 'user-abc',
+  String? entitlement,
+  bool? allowedIn,
+}) => {
       'access_token': 'tok_access',
       'refresh_token': 'tok_refresh',
       'token_type': 'bearer',
@@ -153,6 +157,7 @@ Map<String, dynamic> _sessionResponse({String userId = 'user-abc', String? entit
         'id': userId,
         'email': 'user@example.com',
         if (entitlement != null) 'entitlement': entitlement,
+        if (allowedIn != null) 'allowed_in': allowedIn,
       },
     };
 
@@ -162,6 +167,7 @@ Map<String, dynamic> _nestedSessionResponse({
   String userId = 'user-abc',
   String refreshToken = 'tok_refresh',
   String? entitlement,
+  bool? allowedIn,
 }) =>
     {
       'session': {
@@ -174,6 +180,8 @@ Map<String, dynamic> _nestedSessionResponse({
         'id': userId,
         'email': 'user@example.com',
         if (entitlement != null) 'entitlement': entitlement,
+        // The server's ANSWER, shipped with the session it belongs to.
+        if (allowedIn != null) 'allowed_in': allowedIn,
       },
     };
 
@@ -185,8 +193,12 @@ void main() {
   group('OneloAuth.initialize()', () {
     test('sets isReady=true and restores no session when storage empty', () async {
       final mock = MockHttpClient();
+      // One lenient mock serving both GETs. `/api/sdk/config` reads app_name +
+      // allow_custom_branding; `/api/sdk/flow/init` reads action + url. The
+      // routing keys (action/url) replaced the legacy `hosted_url` when this SDK
+      // moved off /auth/initiate — see OneloAuth._fetchInitiate.
       when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
-          '{"hosted_url":"https://example.com/auth","app_name":"TestApp","allow_custom_branding":false}',
+          '{"action":"present","surface":"sign_in","url":"https://example.com/auth","app_name":"TestApp","allow_custom_branding":false}',
           200));
       final auth = OneloAuth(
         config: _config(),
@@ -202,10 +214,12 @@ void main() {
 
     test('#30 — a 403 fetching the hosted URL surfaces initiateError (no silent skeleton hang), and retry clears it', () async {
       final mock = MockHttpClient();
-      // /auth/initiate → permanent 403 (e.g. attest_invalid); everything else (config) → 200.
-      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+      // /flow/init → permanent 403 (e.g. attest_invalid); everything else (config) → 200.
+      // A 403 must NOT fall through to the legacy /auth/initiate — falling back
+      // would paper over a rejected device with a sign-in form.
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
           .thenAnswer((_) async => http.Response('{"error":"attest_invalid"}', 403));
-      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init'))), headers: any(named: 'headers')))
           .thenAnswer((_) async => http.Response('{"allow_custom_branding":false}', 200));
       final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
       await auth.initialize();
@@ -218,7 +232,8 @@ void main() {
       // retryInitiate with a now-working endpoint clears the error and loads the URL.
       reset(mock);
       when(() => mock.get(any(), headers: any(named: 'headers')))
-          .thenAnswer((_) async => http.Response('{"hosted_url":"https://example.com/auth"}', 200));
+          .thenAnswer((_) async => http.Response(
+              '{"action":"present","surface":"sign_in","url":"https://example.com/auth"}', 200));
       await auth.retryInitiate();
       expect(auth.initiateError, isNull);
       expect(auth.hostedUrl, equals('https://example.com/auth'));
@@ -575,6 +590,358 @@ void main() {
       final before = auth.consentRevision;
       auth.eventStream.debugEmit('legal.consent_required', {});
       expect(auth.consentRevision, equals(before + 1));
+    });
+  });
+
+  /// `isAllowedIn` + the `/flow/init` routing that makes it actionable.
+  ///
+  /// Until 1.33.0 `OneloAuthView` showed the app whenever `currentSession !=
+  /// null`, so a user with NO PLAN signed in and walked straight into a paid
+  /// product. The SDK could not have known better — it never read
+  /// `paywall_enabled` and never asked `/flow/init`, so it could only ever
+  /// render a sign-in form. Both halves are pinned below.
+  group('isAllowedIn', () {
+    test('is false before initialize, even though nothing requires a plan yet', () async {
+      // The isReady term. Without it a restored session would satisfy
+      // `!paywallEnabled` and be waved in during the window before
+      // /api/sdk/config answers — a cold start that fails OPEN.
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: MockHttpClient());
+      expect(auth.isReady, isFalse);
+      expect(auth.isAllowedIn, isFalse);
+    });
+
+    test('is false when signed out', () async {
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
+          '{"action":"present","surface":"sign_in","url":"https://x/auth","paywall_enabled":true}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(auth.isReady, isTrue);
+      expect(auth.currentSession, isNull);
+      expect(auth.isAllowedIn, isFalse);
+    });
+
+    test('reads paywall_enabled off /api/sdk/config', () async {
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
+          '{"action":"present","surface":"sign_in","url":"https://x/auth","paywall_enabled":true}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(auth.paywallEnabled, isTrue);
+    });
+
+    group('social sign-up must be able to create an account', () {
+      // OAuth returns a verified IDENTITY, never an intention. The backend
+      // therefore defaults to `signin`, which refuses to create an account — so
+      // a sign-up that fails to say so is silently downgraded and the user is
+      // told "This account isn't registered" whichever button they pressed.
+      //
+      // The hosted page knows which button it was and puts `intent` on the URL
+      // it navigates to; OneloAuthView intercepts that navigation (providers
+      // reject embedded WebViews) and rebuilds the URL. Dropping the parameter
+      // there made social sign-up impossible on Flutter (Adrian, 2026-08-19).
+      // Nothing here DECIDES the intent — it only has to survive the rebuild.
+
+      Future<Uri> capturedOAuthInit({String? intent}) async {
+        final mock = MockHttpClient();
+        final seen = <Uri>[];
+        when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((inv) async {
+          final uri = inv.positionalArguments[0] as Uri;
+          seen.add(uri);
+          if (uri.path.contains('/oauth/')) {
+            return http.Response('{"url":"https://accounts.google.com/o/oauth2/auth"}', 200);
+          }
+          return http.Response(
+            '{"action":"present","surface":"sign_in","url":"https://st.onelo.tools/auth/hosted?token=x"}',
+            200,
+          );
+        });
+
+        final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+        await auth.initialize();
+        // The browser hand-off cannot run under test; the init request has
+        // already been made by then, which is the whole subject here.
+        try {
+          await auth.signInWithOAuth('google', intent: intent);
+        } catch (_) {}
+        return seen.firstWhere((u) => u.path.contains('/oauth/'));
+      }
+
+      test('a sign-up carries intent=signup to the backend', () async {
+        final uri = await capturedOAuthInit(intent: 'signup');
+        expect(uri.queryParameters['intent'], 'signup');
+      });
+
+      test('a plain sign-in sends no intent, so the backend default applies', () async {
+        final uri = await capturedOAuthInit();
+        expect(uri.queryParameters.containsKey('intent'), isFalse);
+      });
+
+      test('an unrecognised intent is NOT forwarded', () async {
+        // The value arrives off an intercepted URL. Only the two the backend
+        // defines may travel; anything else degrades to the safe default, which
+        // cannot create an account.
+        final uri = await capturedOAuthInit(intent: 'signup-please');
+        expect(uri.queryParameters.containsKey('intent'), isFalse);
+      });
+    });
+
+    group('a gate refusal arriving by deep link', () {
+      // A magic link the gate turns down carries no code, by design — the
+      // backend withholds it rather than let the app decide. The refusal still
+      // has to REACH the app: the browser tab holding it cannot talk to a
+      // Flutter process, and the app is sitting on "Check your inbox".
+      //
+      // The URL is loaded in the app's own sign-in WebView and arrives over a
+      // custom scheme ANY installed app can fire, so most of these tests are
+      // about refusing it.
+
+      /// Signs in far enough that /flow/init has named the hosted origin —
+      /// which is the ONLY thing a deep-linked gate URL is checked against.
+      Future<OneloAuth> readyAuth() async {
+        final mock = MockHttpClient();
+        when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer(
+          (_) async => http.Response(
+            '{"action":"present","surface":"sign_in","url":"https://st.onelo.tools/auth/hosted?token=x"}',
+            200,
+          ),
+        );
+        final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+        await auth.initialize();
+        return auth;
+      }
+
+      Uri gateLink(String target) =>
+          Uri.parse('turingo://callback?gate=' + Uri.encodeComponent(target));
+
+      test('presents a surface on the origin the BACKEND named', () async {
+        final auth = await readyAuth();
+
+        final accepted = await auth
+            .handleGateDeepLink(gateLink('https://st.onelo.tools/no-plan/hosted?token=npt_1'));
+
+        expect(accepted, isTrue);
+        expect(auth.hostedUrl, 'https://st.onelo.tools/no-plan/hosted?token=npt_1');
+      });
+
+      test('refuses a foreign origin', () async {
+        // The one that matters: otherwise any app on the device can render its
+        // own page inside this app's sign-in window.
+        final auth = await readyAuth();
+        final before = auth.hostedUrl;
+
+        final accepted = await auth
+            .handleGateDeepLink(gateLink('https://evil.example.com/no-plan/hosted'));
+
+        expect(accepted, isFalse);
+        expect(auth.hostedUrl, before);
+      });
+
+      test('refuses plain http on the right host', () async {
+        // Downgrade guard — a matching host over http is still interceptable.
+        final auth = await readyAuth();
+
+        final accepted = await auth
+            .handleGateDeepLink(gateLink('http://st.onelo.tools/no-plan/hosted'));
+
+        expect(accepted, isFalse);
+      });
+
+      test('ignores a callback with no gate at all', () async {
+        // The store and portal returns travel the same scheme and must not be
+        // mistaken for a refusal.
+        final auth = await readyAuth();
+
+        expect(await auth.handleGateDeepLink(Uri.parse('turingo://callback?code=oac_1')), isFalse);
+      });
+    });
+
+    test('trusts the SERVER\'S allowed_in over anything derivable here', () async {
+      // Contradictory on purpose: a paywalled app and an unentitled user, which
+      // the old local rule refused. The server said yes — perhaps a grant this
+      // client has not seen — and the server is the one that decides. This rule
+      // lived in three SDKs and each copy was found wrong on a different day.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
+          '{"action":"present","surface":"sign_in","url":"https://x/auth","paywall_enabled":true}', 200));
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => http.Response(
+              jsonEncode(_sessionResponse(entitlement: 'none', allowedIn: true)), 200));
+
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      await auth.exchangeCode('code_abc');
+
+      expect(auth.isAllowedIn, isTrue);
+    });
+
+    test('honours a refusal even when the local flags say otherwise', () async {
+      // No paywall locally, active entitlement → the old rule said "allowed".
+      // The server says no, and giving a paid product away cannot be undone.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
+          '{"action":"present","surface":"sign_in","url":"https://x/auth"}', 200));
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => http.Response(
+              jsonEncode(_sessionResponse(entitlement: 'active', allowedIn: false)), 200));
+
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      await auth.exchangeCode('code_abc');
+
+      expect(auth.isAllowedIn, isFalse);
+    });
+
+    test('falls back when the backend has not shipped allowed_in yet', () async {
+      // Compatibility, not a second source of truth: without this an app would
+      // be locked out the moment the SDK updated ahead of the backend.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
+          '{"action":"present","surface":"sign_in","url":"https://x/auth","paywall_enabled":true}', 200));
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => http.Response(
+              jsonEncode(_sessionResponse(entitlement: 'active')), 200));
+
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      await auth.exchangeCode('code_abc');
+
+      expect(auth.isAllowedIn, isTrue);
+    });
+
+    test('defaults paywall_enabled to false when the backend omits it', () async {
+      // An older backend must not start locking users out of an app that never
+      // had a paywall — absent means "no paywall", the pre-1.33.0 behaviour.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async => http.Response(
+          '{"action":"present","surface":"sign_in","url":"https://x/auth"}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(auth.paywallEnabled, isFalse);
+    });
+  });
+
+  group('/flow/init routing', () {
+    test('present → hostedUrl is whatever surface the backend chose', () async {
+      // The SDK does not choose between sign-in, store and "no active plan" —
+      // it opens the URL it is handed. That is what makes the Apple 3.1.1 gate
+      // (Paywall → Access Gate) apply to Flutter at all; it did not before.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response(
+              '{"action":"present","surface":"no_plan","url":"https://x/no-plan/hosted?token=t"}', 200));
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"paywall_enabled":true}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(auth.hostedUrl, contains('/no-plan/hosted'));
+      expect(auth.initiateError, isNull);
+    });
+
+    test('404 falls back to the legacy /auth/initiate', () async {
+      final mock = MockHttpClient();
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"detail":"Not Found"}', 404));
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"hosted_url":"https://x/auth/hosted?token=t"}', 200));
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init') && !u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(auth.hostedUrl, contains('/auth/hosted'));
+      expect(auth.initiateError, isNull);
+    });
+
+    test('403 does NOT fall back — a rejected device must not get a sign-in form', () async {
+      final mock = MockHttpClient();
+      var legacyCalls = 0;
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"error":"attest_invalid"}', 403));
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async { legacyCalls++; return http.Response('{"hosted_url":"https://x/auth"}', 200); });
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init') && !u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(legacyCalls, 0);
+      expect(auth.hostedUrl, isNull);
+      expect(auth.initiateError, isNotNull);
+    });
+
+    test('a 2xx with an unknown shape is an error, not a legacy fallback', () async {
+      final mock = MockHttpClient();
+      var legacyCalls = 0;
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"something":"else"}', 200));
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async { legacyCalls++; return http.Response('{"hosted_url":"https://x/auth"}', 200); });
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init') && !u.path.contains('/auth/initiate'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(legacyCalls, 0);
+      expect(auth.initiateError, isNotNull);
+    });
+  });
+
+  /// Regressions found by review, each previously uncovered.
+  group('fail-closed + no dead ends', () {
+    test('config FAILURE must not read as "this app has no paywall"', () async {
+      // The one that matters. Config failures are swallowed and `initialize()`
+      // sets isReady in a `finally`, so a plain `false` default made an offline
+      // start / 403 / 500 look identical to a genuinely paywall-free app — and
+      // waved a plan-less user into a paid product. Unknown must DENY.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"error":"attest_invalid"}', 403));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+
+      expect(auth.isReady, isTrue, reason: 'readiness is set in a finally — that is the trap');
+      expect(auth.isAllowedIn, isFalse);
+    });
+
+    test('authorized + entitlement still unconfirmed surfaces a retry, not a dead skeleton', () async {
+      // `revalidateEntitlement()` returns the CACHED entitlement on any non-200,
+      // so a 429/5xx on /auth/user leaves isAllowedIn false. Clearing hostedUrl
+      // unconditionally then left NO url and NO error — a state the view has no
+      // branch for, so it sat on the skeleton forever with no way back.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"action":"authorized"}', 200));
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/auth/user'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"detail":"rate limited"}', 429));
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init') && !u.path.contains('/auth/user'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"paywall_enabled":true}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+
+      expect(auth.isAllowedIn, isFalse);
+      // Exactly one of these must be true or the view has nothing to render.
+      expect(auth.hostedUrl != null || auth.initiateError != null, isTrue,
+          reason: 'null url AND null error is the unreachable-state dead end');
+    });
+
+    test('sendMagicLink sends no code_challenge while the verifier is volatile', () async {
+      // Deliberate. The verifier here is in-memory and regenerated on every
+      // initialize(), while a magic link is opened later — usually after a
+      // relaunch. Binding a challenge to it makes /hosted-callback 401 AFTER the
+      // token is already marked used, so the link is permanently burnt. Pinned so
+      // it cannot be "restored" without persisting the verifier first.
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async =>
+          http.Response('{"action":"present","surface":"sign_in","url":"https://x/auth"}', 200));
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => http.Response('{"success":true}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      await auth.sendMagicLink('ada@example.com');
+
+      final call = verify(() => mock.post(
+          any(that: predicate<Uri>((u) => u.path.contains('/auth/magic-link'))),
+          headers: any(named: 'headers'),
+          body: captureAny(named: 'body'))).captured.single as String;
+      expect(jsonDecode(call), isNot(contains('code_challenge')));
     });
   });
 }
