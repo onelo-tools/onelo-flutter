@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'user_token.dart';
 import 'version.dart';
 
 /// Handler for a named SSE event; receives the decoded `data:` JSON object.
@@ -18,9 +19,17 @@ typedef OneloEventHandler = void Function(Map<String, dynamic> data);
 ///   • refuses to silently downgrade a user-bound stream back to anonymous,
 ///   • unknown event names are ignored (forward-compatible).
 ///
-/// The stream authenticates via the `key` + `userId` + `instance_id` query
-/// params (no bearer token on the stream itself); each event carries an
-/// `app_user_id` that the handler filters against the current user.
+/// The stream authenticates via the `X-Publishable-Key` request header
+/// (ADR-0003 — the key never enters the URL), alongside `userId` +
+/// `instance_id` query params. Each event carries an `app_user_id` that the
+/// handler filters against the current user.
+///
+/// The signed-in user is proven with `Authorization: Bearer <access token>`
+/// (#519), read fresh on EVERY (re)connect so a reconnect never carries an
+/// expired token (the server checks it at connect only). A refused token
+/// (`401 invalid_user_token`) is refreshed once and retried once; refused
+/// again, that connection is opened anonymous (no Bearer, no `userId`) and the
+/// next reconnect tries the user again. Same rules as the JS SDKs.
 class OneloEventStream {
   OneloEventStream({
     required http.Client client,
@@ -32,7 +41,9 @@ class OneloEventStream {
     Future<String?> Function()? getAttestToken,
     Future<String?> Function()? getIntegrityToken,
     void Function(dynamic json)? maybeSelfHeal,
+    OneloUserToken? userToken,
   })  : _client = client,
+        _userToken = userToken,
         _apiUrl = apiUrl,
         _publishableKey = publishableKey,
         _instanceId = instanceId,
@@ -76,8 +87,19 @@ class OneloEventStream {
   /// that swallowed the rejection body without ever offering it to self-heal).
   final void Function(dynamic json)? _maybeSelfHeal;
 
+  /// The signed-in user's access token, sent as `Authorization: Bearer` on
+  /// every connect. Null (no Onelo Auth) sends no token.
+  final OneloUserToken? _userToken;
+  bool _userTokenRefusedWarned = false;
+
   final Map<String, OneloEventHandler> _handlers = {};
   String? _userId;
+  String? _boundUserId;
+
+  /// The identity the LIVE connection is actually bound to: its `userId`, or
+  /// null when not connected or when it fell back to anonymous after a refused
+  /// token. Features applies a snapshot only when this matches its identity.
+  String? get boundUserId => _boundUserId;
   bool _running = false;
   StreamSubscription<String>? _sub;
   Timer? _reconnectTimer;
@@ -133,6 +155,7 @@ class OneloEventStream {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _attempt = 0;
+    _boundUserId = null;
     _sub?.cancel();
     _sub = null;
     // ignore: discarded_futures
@@ -144,10 +167,69 @@ class OneloEventStream {
     _generation++; // invalidate any _connect() mid-await so it won't set _sub
     _running = false;
     _userId = null;
+    _boundUserId = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _sub?.cancel();
     _sub = null;
+  }
+
+  /// Open one connection for [attempt]. Null when superseded mid-connect. A
+  /// non-200 answer's body is read here (for the refusal check / self-heal).
+  Future<_Opened?> _openOnce(int gen, UserTokenAttempt attempt) async {
+    final uri = Uri.parse('$_apiUrl/api/sdk/features/stream').replace(
+      queryParameters: {
+        // A connection whose user token was refused is anonymous: no `userId`.
+        if (_userId != null && !attempt.anonymous) 'userId': _userId!,
+        'instance_id': await _instanceId(),
+        'sdk_platform': 'flutter',
+        'sdk_version': oneloFlutterSdkVersion,
+        if (_environment != null) 'environment': _environment!,
+      },
+    );
+    if (gen != _generation) return null; // superseded during the instance-id await
+    // X-Bundle-Id as a HEADER (the gate reads the header, not a query param).
+    // A stale generation during this await is caught by the post-send check.
+    final bundleId = _getBundleId != null ? await _getBundleId!() : null;
+    // X-Attest-Token (iOS App Attest) on the SSE connect. Non-blocking; omitted
+    // off iOS or before attestation completes.
+    final attestToken = _getAttestToken != null ? await _getAttestToken!() : null;
+    // X-Integrity-Token (Android Play Integrity) — Android twin of attestToken.
+    final integrityToken = _getIntegrityToken != null ? await _getIntegrityToken!() : null;
+    final request = http.Request('GET', uri)
+      ..headers['Accept'] = 'text/event-stream'
+      // The credential is a HEADER, never a query param (ADR-0003): a key in
+      // the URL lands in the reverse proxy's access.log on every connect, and
+      // the backend stamps such a connection Deprecation/Sunset.
+      ..headers['X-Publishable-Key'] = _publishableKey
+      ..headers['X-Sdk-Version'] = oneloFlutterSdkVersion;
+    if (bundleId != null && bundleId.isNotEmpty) request.headers['X-Bundle-Id'] = bundleId;
+    if (attestToken != null && attestToken.isNotEmpty) request.headers['X-Attest-Token'] = attestToken;
+    if (integrityToken != null && integrityToken.isNotEmpty) request.headers['X-Integrity-Token'] = integrityToken;
+    request.headers.addAll(bearerHeaders(attempt.token));
+    final response = await _client.send(request);
+    // A newer open()/stop() won the race while we were connecting — abandon
+    // this response so we don't leak a subscription the current generation
+    // won't own (and won't ever cancel).
+    if (gen != _generation) return null;
+    String? errorBody;
+    if (response.statusCode != 200) {
+      try {
+        errorBody = await response.stream.bytesToString();
+      } catch (_) {
+        // best-effort — a body we can't read just skips the checks below.
+      }
+    }
+    return _Opened(response, errorBody);
+  }
+
+  void _warnUserTokenRefused() {
+    if (_userTokenRefusedWarned) return;
+    _userTokenRefusedWarned = true;
+    debugPrint(
+      "[Onelo] The signed-in user's access token was refused by the Event Stream "
+      '(invalid_user_token) even after a refresh, so the stream was opened without a user.',
+    );
   }
 
   Future<void> _connect() async {
@@ -156,47 +238,48 @@ class OneloEventStream {
     // awaiting below, this connect is stale and must NOT touch _sub.
     final gen = _generation;
     try {
-      final uri = Uri.parse('$_apiUrl/api/sdk/features/stream').replace(
-        queryParameters: {
-          'key': _publishableKey,
-          if (_userId != null) 'userId': _userId!,
-          'instance_id': await _instanceId(),
-          'sdk_platform': 'flutter',
-          'sdk_version': oneloFlutterSdkVersion,
-          if (_environment != null) 'environment': _environment!,
-        },
-      );
-      if (gen != _generation) return; // superseded during the instance-id await
-      // X-Bundle-Id as a HEADER (the gate reads the header, not a query param).
-      // A stale generation during this await is caught by the post-send check.
-      final bundleId = _getBundleId != null ? await _getBundleId!() : null;
-      // X-Attest-Token (iOS App Attest) on the SSE connect. Non-blocking; omitted
-      // off iOS or before attestation completes.
-      final attestToken = _getAttestToken != null ? await _getAttestToken!() : null;
-      // X-Integrity-Token (Android Play Integrity) — Android twin of attestToken.
-      final integrityToken = _getIntegrityToken != null ? await _getIntegrityToken!() : null;
-      final request = http.Request('GET', uri)
-        ..headers['Accept'] = 'text/event-stream'
-        ..headers['X-Sdk-Version'] = oneloFlutterSdkVersion;
-      if (bundleId != null && bundleId.isNotEmpty) request.headers['X-Bundle-Id'] = bundleId;
-      if (attestToken != null && attestToken.isNotEmpty) request.headers['X-Attest-Token'] = attestToken;
-      if (integrityToken != null && integrityToken.isNotEmpty) request.headers['X-Integrity-Token'] = integrityToken;
-      final response = await _client.send(request);
-      // A newer open()/stop() won the race while we were connecting — abandon
-      // this response so we don't leak a subscription the current generation
-      // won't own (and won't ever cancel).
+      // Read fresh on every (re)connect — never a cached, possibly expired token.
+      final token = await _userToken?.current();
       if (gen != _generation) return;
+      var opened = await _openOnce(gen, UserTokenAttempt(token, anonymous: false));
+      if (opened == null) return;
+      var sentToken = token;
+      var anonymousConnection = false;
+      if (token != null && isUserTokenRefusal(opened.response.statusCode, opened.errorBody)) {
+        // Refused: one refresh per refusal episode (shared with Features), one
+        // retry, then this connection goes anonymous.
+        final fresh = await _userToken!.refreshAfterRefusal();
+        if (gen != _generation) return;
+        var refusedAgain = true;
+        if (fresh != null) {
+          opened = await _openOnce(gen, UserTokenAttempt(fresh, anonymous: false));
+          if (opened == null) return;
+          sentToken = fresh;
+          refusedAgain = isUserTokenRefusal(opened.response.statusCode, opened.errorBody);
+        }
+        if (refusedAgain) {
+          _warnUserTokenRefused();
+          opened = await _openOnce(gen, const UserTokenAttempt(null, anonymous: true));
+          if (opened == null) return;
+          sentToken = null;
+          anonymousConnection = true;
+        }
+      }
+      final response = opened.response;
       if (response.statusCode != 200) {
         try {
-          final body = await response.stream.bytesToString();
-          _maybeSelfHeal?.call(jsonDecode(body));
+          final body = opened.errorBody;
+          if (body != null) _maybeSelfHeal?.call(jsonDecode(body));
         } catch (_) {
-          // best-effort — a body we can't read/parse just skips self-heal,
+          // best-effort — a body we can't parse just skips self-heal,
           // same as any other transport hiccup.
         }
         _scheduleReconnect();
         return;
       }
+      // A 200 on connect means the server checked and accepted the token.
+      if (sentToken != null) _userToken?.accepted();
+      _boundUserId = anonymousConnection ? null : _userId;
       _attempt = 0; // connected — reset backoff
       String? event;
       final data = StringBuffer();
@@ -273,8 +356,19 @@ class OneloEventStream {
   void debugEmit(String event, Map<String, dynamic> data) =>
       _dispatch(event, jsonEncode(data));
 
+  /// Test-only: pretend the live connection is bound to [userId] (null = anonymous).
+  @visibleForTesting
+  void debugSetBoundUserId(String? userId) => _boundUserId = userId;
+
   /// Test-only: whether a live SSE subscription is currently held. Lets tests
   /// assert the generation guard didn't orphan a subscription after a supersede.
   @visibleForTesting
   bool get hasActiveSubscriptionForTesting => _sub != null;
+}
+
+/// One connect's answer; [errorBody] is read for a non-200 status only.
+class _Opened {
+  _Opened(this.response, this.errorBody);
+  final http.StreamedResponse response;
+  final String? errorBody;
 }

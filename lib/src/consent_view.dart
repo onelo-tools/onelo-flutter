@@ -4,24 +4,24 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'consent.dart';
+import 'brand_tokens.dart';
 
 /// Dark legal-document loading skeleton, loaded into the WebView immediately so
 /// the gate shows a shimmer instead of a BARE BLACK screen while the hosted
 /// `?gate=1` page loads (the gate often auto-presents right after another modal
 /// closes, so a freshly-mounted WebView would otherwise flash black). Mirrors
 /// the feedback / portal skeleton pattern.
-const _consentSkeletonHtml = '''<!DOCTYPE html><html><head>
+String _consentSkeletonHtml(OneloBrandTokens t) => '''<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#111;font-family:-apple-system,sans-serif;padding:56px 28px 28px;overflow:hidden;display:flex;flex-direction:column;min-height:100vh}
-@keyframes shimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}
-.sk{border-radius:8px;background:linear-gradient(90deg,#1e1e1e 25%,#2a2a2a 50%,#1e1e1e 75%);background-size:600px 100%;animation:shimmer 1.4s infinite linear}
-.title{width:200px;height:26px;margin-bottom:28px;border-radius:6px}
-.line{height:13px;margin-bottom:12px;border-radius:4px}
+body{background:${t.pageBg};font-family:${t.bodyFont};padding:56px 28px 28px;overflow:hidden;display:flex;flex-direction:column;min-height:100vh}
+${t.skeletonCss}
+.title{width:200px;height:26px;margin-bottom:28px}
+.line{height:13px;margin-bottom:12px}
 .spacer{flex:1}
-.btn{height:50px;border-radius:12px;margin-top:20px}
-.btn2{width:160px;height:14px;margin:16px auto 0;border-radius:4px}
+.btn{height:50px;border-radius:${t.buttonRadius.round()}px;margin-top:20px}
+.btn2{width:160px;height:14px;margin:16px auto 0}
 </style></head><body>
 <div class="sk title"></div>
 <div class="sk line" style="width:100%"></div>
@@ -33,7 +33,7 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:56px 28px 28px
 <div class="sk line" style="width:84%"></div>
 <div class="sk line" style="width:60%"></div>
 <div class="spacer"></div>
-<div class="sk btn"></div>
+<div class="strong btn"></div>
 <div class="sk btn2"></div>
 </body></html>''';
 
@@ -93,7 +93,7 @@ class _OneloConsentViewState extends State<OneloConsentView> {
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       // Match the skeleton bg so there is never a flash of the black Scaffold
       // between mount and first paint.
-      ..setBackgroundColor(const Color(0xFF111111))
+      ..setBackgroundColor(OneloBrand.current.pageBgColor)
       ..addJavaScriptChannel(
         'OneloChannel',
         onMessageReceived: (msg) => _handleMessage(msg.message),
@@ -136,7 +136,7 @@ class _OneloConsentViewState extends State<OneloConsentView> {
       ))
       // Paint the skeleton immediately; the real gate page is loaded from the
       // skeleton's onPageFinished above.
-      ..loadHtmlString(_consentSkeletonHtml);
+      ..loadHtmlString(_consentSkeletonHtml(OneloBrand.current));
 
     // Safety net: if the skeleton's onPageFinished never fires (platform quirk),
     // load the real gate page anyway so we can't get stuck on the skeleton.
@@ -154,7 +154,7 @@ class _OneloConsentViewState extends State<OneloConsentView> {
       _realLoaded = false;
       _loaded = false;
     });
-    _controller?.loadHtmlString(_consentSkeletonHtml);
+    _controller?.loadHtmlString(_consentSkeletonHtml(OneloBrand.current));
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted && !_realLoaded) {
         _realLoaded = true;
@@ -226,9 +226,9 @@ class _OneloConsentViewState extends State<OneloConsentView> {
     return PopScope(
       canPop: false,
       child: Scaffold(
-        // Match the skeleton bg (#111) rather than pure black, so the WebView
-        // never flashes a black Scaffold behind it before first paint.
-        backgroundColor: const Color(0xFF111111),
+        // #681 — the brand page ground (same as the skeleton), so the WebView
+        // never flashes a different colour behind it before first paint.
+        backgroundColor: OneloBrand.current.pageBgColor,
         body: SafeArea(
           child: _failed
               ? _errorView()
@@ -240,25 +240,10 @@ class _OneloConsentViewState extends State<OneloConsentView> {
     );
   }
 
-  Widget _errorView() => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                "Couldn't load. Please check your connection and try again.",
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white, fontSize: 16),
-              ),
-              const SizedBox(height: 16),
-              ElevatedButton(
-                onPressed: _retry,
-                child: const Text('Try again'),
-              ),
-            ],
-          ),
-        ),
+  Widget _errorView() => OneloBrandedErrorView(
+        tokens: OneloBrand.current,
+        message: "Couldn't load. Please check your connection and try again.",
+        onPressed: _retry,
       );
 }
 

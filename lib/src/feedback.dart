@@ -1,34 +1,97 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'client.dart';
 import 'features.dart';
+import 'brand_tokens.dart';
 
-const _skeletonHtml = '''<!DOCTYPE html><html><head>
+/// Feedback-form skeleton (icon, title, three type cards, two fields, CTA),
+/// painted from the brand tokens (#681).
+String _skeletonHtml(OneloBrandTokens t) => '''<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px;overflow:hidden}
-@keyframes shimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}
-.sk{border-radius:10px;background:linear-gradient(90deg,#1e1e1e 25%,#2a2a2a 50%,#1e1e1e 75%);background-size:600px 100%;animation:shimmer 1.4s infinite linear}
-.icon{width:64px;height:64px;border-radius:14px;margin:0 auto 16px}
-.title{width:220px;height:22px;margin:0 auto 40px;border-radius:6px}
+body{background:${t.pageBg};font-family:${t.bodyFont};padding:40px 36px 32px;overflow:hidden}
+${t.skeletonCss}
+.icon{width:64px;height:64px;border-radius:${t.cardRadius.round()}px;margin:0 auto 16px}
+.title{width:220px;height:22px;margin:0 auto 40px}
 .cards{display:flex;gap:12px;margin-bottom:32px}
-.card{flex:1;height:76px;border-radius:12px}
-.label{width:60px;height:13px;border-radius:4px;margin-bottom:8px}
-.input{width:100%;height:44px;border-radius:10px;margin-bottom:24px}
-.textarea{width:100%;height:110px;border-radius:10px;margin-bottom:32px}
-.btn{width:100%;height:48px;border-radius:12px}
+.card{flex:1;height:76px;border-radius:${t.cardRadius.round()}px}
+.label{width:60px;height:13px;margin-bottom:8px}
+.input{width:100%;height:44px;margin-bottom:24px}
+.textarea{width:100%;height:110px;margin-bottom:32px}
+.btn{width:100%;height:48px;border-radius:${t.buttonRadius.round()}px}
 </style></head><body>
 <div class="sk icon"></div><div class="sk title"></div>
 <div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
-<div class="sk label"></div><div class="sk input"></div>
-<div class="sk label"></div><div class="sk textarea"></div>
-<div class="sk btn"></div>
+<div class="sk label"></div><div class="strong input"></div>
+<div class="sk label"></div><div class="strong textarea"></div>
+<div class="strong btn"></div>
 </body></html>''';
+
+/// The relay injected into the feedback WebView. It forwards the hosted form's
+/// signals to the `OneloFeedback` channel: submit (auto-close), the canonical
+/// hosted ✕, `onelo:ready`, and (#622) the form's request for a fresh reporter
+/// token `ft` — only when the page posted it to itself, or parked it before the
+/// relay ran. Bound once per document.
+const String kFeedbackRelaySource = '''
+  if (!window.__oneloFeedbackBound) {
+    window.__oneloFeedbackBound = true;
+    var oneloFeedbackRenew = function(d) {
+      if (d && d.type === 'onelo:renew_request' && d.kind === 'feedback' && typeof d.request_id === 'string') {
+        OneloFeedback.postMessage(JSON.stringify(d));
+        return true;
+      }
+      return false;
+    };
+    if (window.__oneloRenewPending) oneloFeedbackRenew(window.__oneloRenewPending);
+    window.addEventListener('message', function(e) {
+      var d = e.data;
+      if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) { return; } }
+      if (!d || !d.type) return;
+      if (e.source === window && oneloFeedbackRenew(d)) return;
+      var t = d.type;
+      if (t === 'onelo:feedback_submitted' || t === 'onelo:feedback_close' || t === 'onelo:ready') {
+        OneloFeedback.postMessage(JSON.stringify(d));
+      }
+    });
+  }
+''';
+
+/// The request id of the form's `onelo:renew_request` (kind `feedback`), or
+/// null for any other message (#622).
+String? feedbackRenewRequestId(Map<String, dynamic>? data) {
+  if (data == null || data['type'] != 'onelo:renew_request' || data['kind'] != 'feedback') return null;
+  final id = data['request_id'];
+  return id is String && id.isNotEmpty ? id : null;
+}
+
+/// Answers a feedback renew request (#622): [fetchUrl] initiates the open
+/// form's options again, so the report keeps its reporter, type and area.
+Future<Map<String, dynamic>> feedbackRenewReply(String requestId, Future<String> Function() fetchUrl) async {
+  try {
+    final hostedUrl = await fetchUrl();
+    return {'type': 'onelo:renewed', 'request_id': requestId, 'hosted_url': hostedUrl};
+  } catch (_) {
+    return {'type': 'onelo:renew_failed', 'request_id': requestId, 'reason': 'renew_failed'};
+  }
+}
+
+/// The script that delivers [reply] into the page as a self-post it trusts.
+String feedbackRenewReplyScript(Map<String, dynamic> reply) =>
+    "window.postMessage(${jsonEncode(reply)}, '*');";
+
+/// True when [current] shares scheme, host and port with [hostedUrl].
+bool feedbackSameOrigin(String? current, String? hostedUrl) {
+  final a = current == null ? null : Uri.tryParse(current);
+  final b = hostedUrl == null ? null : Uri.tryParse(hostedUrl);
+  if (a == null || b == null || a.host.isEmpty) return false;
+  return a.scheme.toLowerCase() == b.scheme.toLowerCase() &&
+      a.host.toLowerCase() == b.host.toLowerCase() &&
+      a.port == b.port;
+}
 
 class FeedbackOptions {
   final String? type; // 'bug' | 'feature_request' | 'general'
@@ -48,30 +111,24 @@ class OneloFeedback {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF111111),
+      backgroundColor: OneloBrand.current.pageBgColor,
       builder: (_) => _FeedbackSheet(
-        fetchUrl: () => _fetchHostedUrl(options),
+        fetchUrl: () => fetchHostedUrl(options),
       ),
     );
   }
 
-  Future<String> _fetchHostedUrl(FeedbackOptions options) async {
+  /// Mint a hosted feedback URL (and with it a fresh reporter token `ft`).
+  /// Signed in, the initiate call carries the user's access token (#820).
+  @visibleForTesting
+  Future<String> fetchHostedUrl(FeedbackOptions options) async {
     final params = <String, String>{'key': _client.publishableKey};
     if (options.type != null) params['type'] = options.type!;
     if (options.area != null) params['area'] = options.area!;
     final active = _features.getActiveFeatures();
     if (active.isNotEmpty) params['session'] = jsonEncode(active);
 
-    final uri = Uri.parse('${_client.apiUrl}/api/sdk/feedback/initiate').replace(queryParameters: params);
-    // userId as a header (X-Onelo-User-Id), not a query param → stays out of logs.
-    // Use the client's ASYNC headers so X-Bundle-Id + X-Onelo-Instance-Id ride
-    // along — the backend security gate 403s a live app on /feedback/initiate
-    // without X-Bundle-Id (the sync sdkHeaders can't await either value).
-    final headers = {
-      ...await _client.securityHeaders(),
-      if (options.userId != null) 'X-Onelo-User-Id': options.userId!,
-    };
-    final res = await http.get(uri, headers: headers);
+    final res = await _client.feedbackInitiate(params, userId: options.userId);
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw Exception('Feedback initiate failed: ${res.statusCode}');
     }
@@ -94,6 +151,8 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
   bool _formLoaded = false;
   bool _popped = false;
   String _hostedHost = '';
+  /// The hosted form URL last loaded — a renew answer goes only to its origin.
+  String? _hostedUrl;
 
   /// #40 Phase 2 — true once the hosted feedback page posts `onelo:ready`. From
   /// then on its OWN canonical ✕ (rendered by the hosted page) owns the close
@@ -132,7 +191,7 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
     super.initState();
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(const Color(0xFF111111))
+      ..setBackgroundColor(OneloBrand.current.pageBgColor)
       ..addJavaScriptChannel('OneloFeedback', onMessageReceived: (msg) {
         final data = jsonDecode(msg.message) as Map<String, dynamic>?;
         final type = data?['type'];
@@ -143,6 +202,9 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
         } else if (type == 'onelo:ready') {
           // Hosted page mounted → hide the native fail-safe ✕.
           _onHostedReady();
+        } else {
+          final requestId = feedbackRenewRequestId(data);
+          if (requestId != null) _answerRenew(requestId);
         }
       })
       ..setNavigationDelegate(NavigationDelegate(
@@ -150,20 +212,7 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
           // Bind the postMessage relay ONCE — onPageFinished fires on every
           // navigation (skeleton → form → …); re-adding the listener each time
           // would relay a single submit message N times → N pops → black screen.
-          _controller.runJavaScript('''
-            if (!window.__oneloFeedbackBound) {
-              window.__oneloFeedbackBound = true;
-              window.addEventListener('message', function(e) {
-                if (!e.data || !e.data.type) return;
-                var t = e.data.type;
-                // Relay submit (auto-close), the canonical hosted ✕ close, and the
-                // ready signal (hosted page mounted → hide native fail-safe ✕).
-                if (t === 'onelo:feedback_submitted' || t === 'onelo:feedback_close' || t === 'onelo:ready') {
-                  OneloFeedback.postMessage(JSON.stringify(e.data));
-                }
-              });
-            }
-          ''');
+          _controller.runJavaScript(kFeedbackRelaySource);
           // Track the ACTUALLY-served host (handles an APP_URL apex↔www or
           // http→https redirect) and mark the form loaded. External-link routing
           // is gated on `_formLoaded` so a main-frame redirect DURING the initial
@@ -205,17 +254,29 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
     super.dispose();
   }
 
+  /// #622 — the form's reporter token `ft` (30 minutes) expired before submit.
+  /// Initiate the same form again and answer into the page, which submits with
+  /// its fresh `ft`. Only a page still on the hosted form's origin is answered.
+  Future<void> _answerRenew(String requestId) async {
+    final current = await _controller.currentUrl();
+    if (!feedbackSameOrigin(current, _hostedUrl)) return;
+    final reply = await feedbackRenewReply(requestId, widget.fetchUrl);
+    if (!mounted) return;
+    await _controller.runJavaScript(feedbackRenewReplyScript(reply));
+  }
+
   void _load() {
     // No setState here on purpose: _load runs from initState (where setState is
     // unsafe) as well as from the retry button. The retry button resets `_failed`
     // itself before calling this; the async catchError below sets it (safe — it
     // runs in a later microtask, after the first build).
     // Skeleton first (instant dark placeholder), then the real hosted form.
-    _controller.loadHtmlString(_skeletonHtml);
+    _controller.loadHtmlString(_skeletonHtml(OneloBrand.current));
     widget.fetchUrl().then((url) {
       if (!mounted) return;
       // _hostedHost + _formLoaded are set from the actual served page in
       // onPageFinished (handles redirects); just navigate here.
+      _hostedUrl = url;
       _controller.loadRequest(Uri.parse(url));
     }).catchError((Object e) {
       // Surface the failure with a RETRY instead of silently vanishing the sheet
@@ -249,7 +310,7 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
             width: 40,
             margin: const EdgeInsets.symmetric(vertical: 8),
             decoration: BoxDecoration(
-              color: Colors.grey[600],
+              color: OneloBrand.current.borderColor,
               borderRadius: BorderRadius.circular(2),
             ),
           ),
@@ -271,7 +332,7 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
             top: 8,
             right: 8,
             child: IconButton(
-              icon: const Icon(Icons.close, color: Colors.white),
+              icon: Icon(Icons.close, color: OneloBrand.current.textColor),
               onPressed: _dismiss,
             ),
           ),
@@ -281,24 +342,12 @@ class _FeedbackSheetState extends State<_FeedbackSheet> {
     );
   }
 
-  Widget _errorView() => Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              "Couldn't load feedback. Please try again.",
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white, fontSize: 16),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: () {
-                setState(() => _failed = false);
-                _load();
-              },
-              child: const Text('Try again'),
-            ),
-          ],
-        ),
+  Widget _errorView() => OneloBrandedErrorView(
+        tokens: OneloBrand.current,
+        message: "Couldn't load feedback. Please try again.",
+        onPressed: () {
+          setState(() => _failed = false);
+          _load();
+        },
       );
 }

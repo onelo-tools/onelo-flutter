@@ -19,7 +19,7 @@ void main() {
   });
 }
 
-Future<Widget> snippetFeaturesExample(String currentUserId, String hash) async {
+Future<Widget> snippetFeaturesExample(String currentUserId, String hash, BuildContext context) async {
   // ── init (snippet INIT block) ──────────────────────────────────────────────
   final onelo = Onelo(
     publishableKey: 'onelo_pk_live_x',
@@ -75,7 +75,7 @@ Future<Widget> snippetFeaturesExample(String currentUserId, String hash) async {
     onPressed: f.isEnabled
         ? () {/* runExport */}
         : canUpgrade
-            ? () => onelo.openUpgrade(f.requiredPlan!)
+            ? () => onelo.openUpgrade(f.requiredPlan!, context: context)
             : null,
     child: Text(f.isEnabled
         ? 'Export'

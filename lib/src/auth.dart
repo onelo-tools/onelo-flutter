@@ -9,9 +9,13 @@ import 'http_client.dart';
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'attest.dart';
+import 'marketing_consent.dart';
 import 'event_stream.dart';
+import 'plan_change.dart';
 import 'types.dart';
+import 'user_token.dart';
 import 'version.dart';
+import 'brand_tokens.dart';
 
 class OneloAuth extends ChangeNotifier {
   final OneloConfig _config;
@@ -61,6 +65,15 @@ class OneloAuth extends ChangeNotifier {
   /// (parity with RN's OneloAuthGate retry). Cleared on a successful fetch / retry.
   String? _initiateError;
   String? _pkceVerifier;
+
+  /// Verifier bound to the hosted flow (`/flow/init`, `/auth/initiate`), mirrored
+  /// into secure storage so a return after a relaunch can still be exchanged.
+  /// See [_beginFlowPkce].
+  String? _flowVerifier;
+  final DateTime Function() _clock;
+  static const _flowVerifierKey = 'onelo_flow_code_verifier';
+  static const _flowVerifierIssuedAtKey = 'onelo_flow_code_verifier_issued_at';
+  static const _flowVerifierLifetime = Duration(minutes: 15);
   String? _instanceId;
   bool _attestRequired = false;
   /// Android Play Integrity: the developer's Google Cloud project NUMBER
@@ -83,17 +96,61 @@ class OneloAuth extends ChangeNotifier {
   Future<OneloSession?>? _refreshInFlight;
   final List<Completer<void>> _readyWaiters = [];
   static const _heartbeatInterval = Duration(minutes: 13);
+  /// Delay before the retry after [attempt] consecutive transient refresh
+  /// failures: 5 s, 10 s, 20 s, 40 s, then 60 s. The first lands inside the
+  /// server's 30 s refresh-token grace window (see [_scheduleRefreshRetry]).
+  @visibleForTesting
+  static Duration refreshRetryDelay(int attempt) {
+    final seconds = 5 * (1 << attempt.clamp(0, 10));
+    return Duration(seconds: seconds > 60 ? 60 : seconds);
+  }
+
+  int _refreshRetryAttempt = 0;
   /// Refresh the access token this many seconds before it expires.
   static const _refreshLeadSeconds = 60;
 
   OneloSession? get currentSession => _currentSession;
+
+  /// The signed-in user's access token for the Features calls and the Event
+  /// Stream (#519): read fresh per call (a token at, or within 30 s of, expiry
+  /// is refreshed first), refreshed at most once per refusal episode. Null
+  /// token when signed out.
+  late final OneloUserToken userToken = OneloUserToken(
+    current: _accessTokenForFeatures,
+    refresh: () async => (await refreshSession())?.accessToken,
+  );
+
+  /// The user the current token-refusal episode belongs to; see [_onSessionChanged].
+  String? _userTokenOwner;
+
+  Future<String?> _accessTokenForFeatures() async {
+    final session = _currentSession;
+    if (session == null) return null;
+    if (DateTime.now().isAfter(session.expiresAt.subtract(const Duration(seconds: 30)))) {
+      await refreshSession();
+    }
+    return _currentSession?.accessToken;
+  }
+
+  /// A different user (or signing out) starts a new token-refusal episode. The
+  /// same user — a refresh republishing the session — does not: that is what
+  /// keeps a persistently refused token from looping refresh → call → refresh.
+  void _onSessionChanged() {
+    final userId = _currentSession?.user.id;
+    if (userId == _userTokenOwner) return;
+    _userTokenOwner = userId;
+    userToken.reset();
+  }
   OneloUser? get currentUser => _currentSession?.user;
   bool get isLoading => _isLoading;
   bool get isReady => _isReady;
 
-  /// True once the server has revoked this session (ban, account deletion,
-  /// refresh-token reuse, or all-sessions-revoked) and the SDK has cleared it
-  /// locally. Surface a "signed out remotely" toast off this if you like.
+  /// True once the server has revoked this ACCOUNT's access (a ban, account
+  /// deletion, or all-sessions-revoked) and the SDK has cleared it locally.
+  /// Surface a "signed out remotely" toast off this if you like. An ended
+  /// session — expired, not recognised, or its refresh token presented again
+  /// outside the server's grace window (`session_compromised`) — is NOT a
+  /// revocation: the session just clears and the user signs in again.
   bool get isUserRevoked => _isUserRevoked;
 
   /// Whether the signed-in user currently has paid access. Mirrors Swift
@@ -225,6 +282,12 @@ class OneloAuth extends ChangeNotifier {
   /// of a blank frame. Mirrors Swift `pageBackgroundColorHex`.
   String? get pageBackgroundColorHex => _pageBackgroundColorHex;
 
+  /// #681 — the app's resolved brand tokens (`brand_tokens` from
+  /// `/api/sdk/config`, refreshed by store / portal / upgrade initiate
+  /// responses; cached for the next cold start). Every SDK view paints its
+  /// chrome from these; neutral before config — never Onelo orange.
+  OneloBrandTokens get brandTokens => OneloBrand.current;
+
   /// #36 — true when a stored session was detected at startup (the auto-login
   /// case). Lets OneloAuthView show the branded splash specifically while an
   /// existing session is being restored, rather than a blank screen. Mirrors
@@ -259,7 +322,10 @@ class OneloAuth extends ChangeNotifier {
     // in by the Onelo root (auth owns the instance-id the stream binds to, so the
     // stream must be created here, not in the features module).
     String? featureEnvironment,
+    // Test seam for the flow verifier's reuse window.
+    @visibleForTesting DateTime Function()? clock,
   })  : _config = config,
+        _clock = clock ?? DateTime.now,
         _storage = storage ?? const FlutterSecureStorage(),
         _httpClient = httpClient ?? OneloHttpClient() {
     _eventStream = OneloEventStream(
@@ -280,7 +346,12 @@ class OneloAuth extends ChangeNotifier {
       // time (found via a live device test: continuous bundle_id_mismatch on
       // every reconnect attempt, never recovering).
       maybeSelfHeal: (json) => attest?.maybeSelfHealFromError(json),
+      // The signed-in user's Bearer on every connect (#519).
+      userToken: userToken,
     );
+    // Registered first, so the episode is reset before any other listener
+    // (the Onelo root's features reload) reacts to a user change.
+    addListener(_onSessionChanged);
     // Realtime remote-logout: the backend fans `session.revoked` to ALL
     // subscribers of the app, so filter by `app_user_id` — a missing target is
     // treated as "this user" (forward-compatible). Sub-second vs the 13-min
@@ -291,6 +362,13 @@ class OneloAuth extends ChangeNotifier {
       if (target != null && current != null && target != current) return;
       // ignore: discarded_futures
       _clearSession(revoked: true);
+    });
+    // #635: this user's grant changed (purchase, switch, refund, pause…). The
+    // backend sends it only to this user's streams, right after the fresh
+    // `features_updated`; re-read the entitlement so hasActiveAccess follows.
+    _eventStream.on('paywall.access_changed', (_) {
+      // ignore: discarded_futures
+      revalidateEntitlement().catchError((Object _) => OneloEntitlement.none);
     });
     // Legal consent changed server-side → bump the revision so a mounted
     // OneloConsentGate re-checks and re-presents if newly blocking.
@@ -328,7 +406,11 @@ class OneloAuth extends ChangeNotifier {
     await _primeSplashState();
     notifyListeners();
     try {
-      await _restoreSession();
+      try {
+        await _restoreSession();
+      } finally {
+        _markSessionRestored();
+      }
       await _registerPkceChallenge();
       // Kick off iOS App Attest in the BACKGROUND when the backend requires it.
       // Never block SDK readiness on it (parity with Swift, which runs it in a
@@ -380,6 +462,13 @@ class OneloAuth extends ChangeNotifier {
           refreshToken.isNotEmpty;
       final cachedBg = await _storage.read(key: 'onelo_checkout_bg_color');
       if (cachedBg != null && cachedBg.isNotEmpty) _pageBackgroundColorHex = cachedBg;
+      // #681 — the cached brand tokens, so the first paint wears the app's brand.
+      final cachedTokens = await _storage.read(key: 'onelo_brand_tokens');
+      if (cachedTokens != null && cachedTokens.isNotEmpty) {
+        try {
+          OneloBrand.set(OneloBrandTokens.parse(jsonDecode(cachedTokens) as Map<String, dynamic>));
+        } catch (_) {/* stale / malformed cache — keep neutral until config */}
+      }
       // Last known paywall answer, so an offline relaunch gates correctly instead
       // of denying a legitimate user of a non-paywall app. See [_paywallEnabled].
       final cachedPaywall = await _storage.read(key: 'onelo_paywall_enabled');
@@ -390,6 +479,20 @@ class OneloAuth extends ChangeNotifier {
       // back to the default branded background and a plain frame.
       debugPrint('[OneloAuth] splash prime skipped: $e');
     }
+  }
+
+  final Completer<void> _sessionRestoredCompleter = Completer<void>();
+
+  /// True once [initialize] has finished restoring any stored session (signed
+  /// in or not). Features binds its first identity only then (#738), so a
+  /// returning user never gets an anonymous snapshot first.
+  bool get isSessionRestored => _sessionRestoredCompleter.isCompleted;
+
+  /// Completes when [isSessionRestored] becomes true.
+  Future<void> get sessionRestored => _sessionRestoredCompleter.future;
+
+  void _markSessionRestored() {
+    if (!_sessionRestoredCompleter.isCompleted) _sessionRestoredCompleter.complete();
   }
 
   /// Returns the current in-memory session. Call after [initialize()].
@@ -430,11 +533,13 @@ class OneloAuth extends ChangeNotifier {
   Future<void> _clearSession({bool revoked = false}) async {
     _stopHeartbeat();
     _cancelRefreshTimer();
+    _refreshRetryAttempt = 0;
     _eventStream.stop();
     await _storage.delete(key: 'onelo_access_token');
     await _storage.delete(key: 'onelo_refresh_token');
     await _storage.delete(key: 'onelo_expires_at');
     await _storage.delete(key: 'onelo_user_json');
+    await _clearFlowPkce();
     _currentSession = null;
     if (revoked) _isUserRevoked = true;
     notifyListeners();
@@ -473,16 +578,19 @@ class OneloAuth extends ChangeNotifier {
         }),
       );
       if (response.statusCode == 200) {
+        _refreshRetryAttempt = 0;
         // Response is the NESTED shape {session:{...}, user:{...}} with a rotated
         // refresh_token — _saveSession handles the unwrap + persists the new token.
         await _saveSession(jsonDecode(response.body) as Map<String, dynamic>);
         return _currentSession;
       }
       // 401 (session_invalid / session_expired / session_compromised) or 403
-      // (account_deleted / suspended / payment_failed) = the session is dead →
-      // clear locally and force re-login.
+      // (banned / no_plan_available) = the session is over → clear locally and
+      // re-login. Only a BAN flags isUserRevoked ("signed out remotely"); an
+      // ended or replaced session is neutral (#548).
       if (response.statusCode == 401 || response.statusCode == 403) {
-        await _clearSession(revoked: true);
+        _refreshRetryAttempt = 0;
+        await _clearSession(revoked: refreshRefusalIsBan(response.body));
         return null;
       }
       // Transient (5xx / 429) — keep the session and retry shortly, so a temporary
@@ -501,10 +609,18 @@ class OneloAuth extends ChangeNotifier {
     }
   }
 
-  /// Re-arm a short retry after a transient refresh failure (5xx / offline).
+  /// Re-arm a retry after a transient refresh failure (5xx incl. 503
+  /// `refresh_unavailable`, 429, offline), with backoff. The session is kept.
+  ///
+  /// The first retry comes after 5 s, not 30 s: if the failed request DID
+  /// reach the server (the response was lost), the token was already rotated
+  /// there, and the server accepts the old token again only inside a 30 s
+  /// grace window (#547). A retry at 30 s + latency lands outside it.
   void _scheduleRefreshRetry() {
     _cancelRefreshTimer();
-    _refreshTimer = Timer(const Duration(seconds: 30), () {
+    final delay = refreshRetryDelay(_refreshRetryAttempt);
+    _refreshRetryAttempt++;
+    _refreshTimer = Timer(delay, () {
       _refreshTimer = null;
       // ignore: discarded_futures
       refreshSession();
@@ -531,27 +647,23 @@ class OneloAuth extends ChangeNotifier {
       // `allowedIn` — so updating only the entitlement would leave the stored
       // answer saying "no" for someone who had just paid: locked out by the very
       // refresh meant to let them in. Absent keeps the previous value.
-      final allowedIn =
-          data['allowed_in'] is bool ? data['allowed_in'] as bool : session.user.allowedIn;
-      if (entitlement != session.user.entitlement || allowedIn != session.user.allowedIn) {
-        final user = OneloUser(
-          id: session.user.id,
-          email: session.user.email,
-          role: session.user.role,
-          tenantId: session.user.tenantId,
-          entitlement: entitlement,
-          allowedIn: allowedIn,
-        );
+      // #819: allowedIn, emailVerified and accessReason move together.
+      final user = session.user.mergingAccessAnswer(data, entitlement);
+      if (entitlement != session.user.entitlement ||
+          user.allowedIn != session.user.allowedIn ||
+          user.emailVerified != session.user.emailVerified ||
+          user.accessReason != session.user.accessReason) {
         _currentSession = OneloSession(
           accessToken: session.accessToken,
           refreshToken: session.refreshToken,
           expiresAt: session.expiresAt,
           user: user,
         );
-        await _storage.write(
-          key: 'onelo_user_json',
-          value: jsonEncode({'id': user.id, 'email': user.email, 'entitlement': entitlement.name}),
-        );
+        // The whole user in the wire shape `_parseUser` reads back. This wrote
+        // only id/email/entitlement, so a cold start after any revalidation
+        // forgot the server's answer (`allowed_in`) and fell back to the local
+        // rule (#819 found it on the same path).
+        await _storage.write(key: 'onelo_user_json', value: jsonEncode(userWireMap(user)));
         notifyListeners();
       }
       return entitlement;
@@ -565,9 +677,25 @@ class OneloAuth extends ChangeNotifier {
     return _signInOrUp(path: '/api/sdk/auth/signin', email: email, password: password, isRetry: false);
   }
 
+  OneloSignupMarketingConsent _signupMarketingConsent = OneloSignupMarketingConsent.notAsked;
+
+  /// #818 — should your own sign-up screen ask for Marketing Consent, and with
+  /// what text (in the device language). From `/api/sdk/config`.
+  OneloSignupMarketingConsent get signupMarketingConsent => _signupMarketingConsent;
+
   /// Paid plan only — create a new account with email and password.
-  Future<OneloSession> signUp(String email, String password) async {
-    return _signInOrUp(path: '/api/sdk/auth/signup', email: email, password: password, isRetry: false);
+  ///
+  /// [marketingConsent] (#818): the person ticked the Marketing Consent
+  /// checkbox your screen showed with [signupMarketingConsent]'s text. Never
+  /// pre-tick it; sent only when true.
+  Future<OneloSession> signUp(String email, String password, {bool marketingConsent = false}) async {
+    return _signInOrUp(
+      path: '/api/sdk/auth/signup',
+      email: email,
+      password: password,
+      isRetry: false,
+      extra: OneloSignupMarketingConsent.signUpFields(marketingConsent, _signupMarketingConsent),
+    );
   }
 
   Future<OneloSession> _signInOrUp({
@@ -575,6 +703,7 @@ class OneloAuth extends ChangeNotifier {
     required String email,
     required String password,
     required bool isRetry,
+    Map<String, dynamic> extra = const {},
   }) async {
     // #25 — gated POST: wait for the attest token on the first attempt (the retry
     // path already has it). No-op for non-attest apps.
@@ -588,11 +717,12 @@ class OneloAuth extends ChangeNotifier {
         'email': email,
         'password': password,
         if (verifier != null) 'code_verifier': verifier,
+        ...extra,
       }),
     );
     if (response.statusCode == 401 && response.body.contains('PKCE') && !isRetry) {
       await _registerPkceChallenge();
-      return _signInOrUp(path: path, email: email, password: password, isRetry: true);
+      return _signInOrUp(path: path, email: email, password: password, isRetry: true, extra: extra);
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception('Auth failed (${response.statusCode}): ${response.body}');
@@ -650,7 +780,7 @@ class OneloAuth extends ChangeNotifier {
     final providerUrl = (jsonDecode(initResponse.body) as Map<String, dynamic>)['url'] as String;
     // Opens the provider and returns the full callback URL once it redirects to
     // `<scheme>://callback?code=oac_...`.
-    final result = await FlutterWebAuth2.authenticate(
+    final result = await webAuthenticate(
       url: providerUrl,
       callbackUrlScheme: _config.callbackScheme,
     );
@@ -658,8 +788,110 @@ class OneloAuth extends ChangeNotifier {
     if (code == null) {
       throw Exception('OAuth cancelled or no code returned');
     }
-    await exchangeCode(code); // sends code_verifier — REQUIRED for OAuth codes
+    // The provider's system browser has just closed over the hosted page, which
+    // never learns that it finished (#666). Say so BEFORE the round trip, so
+    // `OneloAuthView` covers the idle form with "Signing you in…" instead of
+    // leaving it on screen as if sign-in had failed.
+    _isCompletingSignIn = true;
+    notifyListeners();
+    try {
+      // The verifier bound on /oauth/init above, NOT the flow verifier: an
+      // `oac_` code carries this call's challenge (#541 review F1).
+      await _exchangeCodeWith(code, verifier: verifier, usesFlowVerifier: false);
+    } finally {
+      // Success: the session is already published, so the view has swapped to
+      // the app. Failure: the form comes back — never a stuck cover.
+      _isCompletingSignIn = false;
+      notifyListeners();
+    }
     return _currentSession!;
+  }
+
+  bool _isCompletingSignIn = false;
+
+  /// True while a social sign-in that came back from the provider's system
+  /// browser is being exchanged for a session (#666). `OneloAuthView` covers
+  /// the hosted page with a "Signing you in…" state meanwhile — the native twin
+  /// of the hosted page's own pending state on the web (#543). Never set for a
+  /// cancelled provider window or for the password path (the hosted page shows
+  /// its own "Loading…" there).
+  bool get isCompletingSignIn => _isCompletingSignIn;
+
+  /// Opens the provider in a system browser and returns the callback URL.
+  /// Replaceable only so tests can drive [signInWithOAuth] without the
+  /// platform plugin.
+  @visibleForTesting
+  Future<String> Function({required String url, required String callbackUrlScheme})
+      webAuthenticate = FlutterWebAuth2.authenticate;
+
+  /// Sends the signed-in user a fresh Email Verification link (#819).
+  ///
+  /// Only for apps with their own screen: when the parent App requires Email
+  /// Verification, `OneloAuthView` already shows "check your inbox" with a
+  /// resend button and hands the session back by itself. The previous link
+  /// stops working; at most 3 e-mails an hour
+  /// ([OneloVerificationErrorKind.rateLimited]). Throws
+  /// [OneloVerificationErrorKind.verificationOff] when the App has it Off.
+  ///
+  /// [redirectTo] — your own landing (an allowed web origin, or
+  /// `<your-scheme>://…`); the link then carries `onelo_verify_token` for
+  /// [confirmEmail]. Omitted, the link opens Onelo's hosted page.
+  Future<OneloVerificationResend> resendVerificationEmail({String? redirectTo}) async {
+    final session = _currentSession;
+    if (session == null) {
+      throw const OneloVerificationException(
+          OneloVerificationErrorKind.notAuthenticated, 'User is not authenticated');
+    }
+    final response = await _httpClient.post(
+      Uri.parse('${_config.apiUrl}/api/sdk/auth/verify-email/resend'),
+      headers: await _headers(json: true, bearer: session.accessToken),
+      body: jsonEncode({
+        'publishableKey': _config.publishableKey,
+        if (redirectTo != null) 'verify_redirect_to': redirectTo,
+      }),
+    );
+    final body = _jsonBody(response.body);
+    if (response.statusCode != 200) {
+      throw OneloVerificationException.fromResponse(response.statusCode, body);
+    }
+    return OneloVerificationResend(
+      sent: body['sent'] == true,
+      emailVerified: body['email_verified'] == true,
+    );
+  }
+
+  /// Confirms the user's address with the `onelo_verify_token` your own landing
+  /// received from the verification link (#819). Single use. When a session is
+  /// signed in on this device it is refreshed, so [isAllowedIn] opens the app at
+  /// once — never by re-reading `/api/sdk/auth/user`, which caches its answer
+  /// per token for 30 s.
+  Future<void> confirmEmail(String token) async {
+    final response = await _httpClient.post(
+      Uri.parse('${_config.apiUrl}/api/sdk/auth/verify-email/confirm'),
+      headers: await _headers(json: true),
+      body: jsonEncode({'publishableKey': _config.publishableKey, 'token': token}),
+    );
+    if (response.statusCode != 200) {
+      throw OneloVerificationException.fromResponse(response.statusCode, _jsonBody(response.body));
+    }
+    if (_currentSession != null) {
+      try {
+        await refreshSession();
+      } catch (e) {
+        // The address IS confirmed; the next scheduled refresh or foreground
+        // revalidation carries the new answer.
+        debugPrint('[onelo] confirmEmail: session refresh after confirming failed: $e');
+      }
+    }
+  }
+
+  static Map<String, dynamic> _jsonBody(String raw) {
+    try {
+      final decoded = jsonDecode(raw);
+      return decoded is Map<String, dynamic> ? decoded : <String, dynamic>{};
+    } on FormatException {
+      return <String, dynamic>{};
+    }
   }
 
   /// Sends a password-reset email. Available on all plans.
@@ -680,15 +912,11 @@ class OneloAuth extends ChangeNotifier {
 
   /// Sends a one-time magic-link sign-in email. Available on all plans.
   Future<void> sendMagicLink(String email, {String? redirectTo}) async {
-    // NOTE — no `code_challenge` here, deliberately (2026-08-18). Binding a PKCE
-    // challenge to a magic link is the right design and the backend supports it,
-    // but it cannot ship until the verifier is PERSISTED in a magic-link-specific
-    // slot the way Swift's `_beginFlowPKCE` does. `_pkceVerifier` is in-memory,
-    // is rotated on sign-out and REGENERATED on every `initialize()` — and a magic
-    // link is by definition opened later, usually after a relaunch. A challenge
-    // bound to a verifier that no longer exists makes /hosted-callback 401, and
-    // the token is already marked used at consume, so the user is locked out with
-    // no recovery. A challenge-less link is weaker; a burnt link is broken.
+    // NOTE — no `code_challenge` here, deliberately. This custom-UI link stays
+    // UNPAIRED: it must be opened on the device running the app (#540). Only the
+    // hosted flow pairs a magic link with a code, through the persisted flow
+    // verifier its `/flow/init` challenge is bound to ([_beginFlowPkce], #541).
+    // A custom UI has no hosted code screen to finish on another device.
     final response = await _httpClient.post(
       Uri.parse('${_config.apiUrl}/api/sdk/auth/magic-link'),
       headers: await _headers(json: true),
@@ -705,22 +933,131 @@ class OneloAuth extends ChangeNotifier {
 
   /// Called by OneloAuthView after receiving the authorization code from the hosted WebView.
   Future<void> exchangeCode(String code) async {
+    // The FLOW verifier first: its challenge is on the token this code hangs
+    // off, and the stored copy survives a relaunch. `_pkceVerifier` (the
+    // /api/sdk/config pair) is for codes minted without it.
+    final flowVerifier = await _pendingFlowVerifier();
+    await _exchangeCodeWith(
+      code,
+      verifier: flowVerifier ?? _pkceVerifier,
+      usesFlowVerifier: flowVerifier != null,
+    );
+  }
+
+  /// POST /hosted-callback with [verifier]. [usesFlowVerifier] says whether it
+  /// was the hosted-flow verifier, which a successful exchange then retires.
+  Future<void> _exchangeCodeWith(String code, {required String? verifier, required bool usesFlowVerifier}) async {
     final response = await _httpClient.post(
       Uri.parse('${_config.apiUrl}/api/sdk/auth/hosted-callback'),
       headers: await _headers(json: true),
       body: jsonEncode({
         'publishableKey': _config.publishableKey,
         'code': code,
-        if (_pkceVerifier != null) 'code_verifier': _pkceVerifier,
+        if (verifier != null) 'code_verifier': verifier,
       }),
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('Code exchange failed (${response.statusCode}): ${response.body}');
+      // One attempt, no retry. The stored verifier is kept: the backend checks
+      // PKCE before it spends the code, so the link can still be completed.
+      throw Exception(
+          'Code exchange failed (${response.statusCode}): ${_exchangeFailureReason(response.body)}');
     }
     await _saveSession(jsonDecode(response.body) as Map<String, dynamic>);
+    // Finished: a stale verifier could only mismatch the next flow's challenge.
+    // A native OAuth code used its own verifier; the flow one may still be
+    // bound to an outstanding link, so it stays.
+    if (usesFlowVerifier) await _clearFlowPkce();
+    // A hosted flow can chain sign-in → store, and the store's card returns a
+    // code too, so an exchanged code may carry a purchase: reconcile the plan
+    // at once (#659). A plain sign-in costs one extra resolve.
+    reportPlanChange(const PlanChange.purchase());
   }
 
+  /// Set by `Onelo` to its plan-change refresher (#659). Internal wiring.
+  void Function(PlanChange change)? onPlanChange;
+
+  /// A hosted container finished a purchase or a plan switch (#659).
+  /// Internal: the SDK's own views call it; `Onelo` reconciles features +
+  /// entitlement.
+  void reportPlanChange(PlanChange change) => onPlanChange?.call(change);
+
   // ── PKCE ──────────────────────────────────────────────────────────────
+
+  /// The backend's reason for a refused exchange: FastAPI's `detail`
+  /// ("code_verifier required", "PKCE verification failed", "Code already
+  /// used"), else `error`, else the raw body.
+  static String _exchangeFailureReason(String body) {
+    try {
+      final data = jsonDecode(body);
+      if (data is Map) {
+        final reason = data['detail'] ?? data['error'];
+        if (reason is String && reason.isNotEmpty) return reason;
+      }
+    } catch (_) {}
+    return body;
+  }
+
+  /// The PKCE challenge for the hosted flow being started (#541), the mirror of
+  /// Swift's `_beginFlowPKCE`.
+  ///
+  /// The challenge on `/flow/init` is what pairs a magic link the hosted page
+  /// sends: opened on another device, the link shows a code screen and the
+  /// sign-in completes in this app (#540). The verifier is persisted, because
+  /// the code often comes back after the app was killed.
+  ///
+  /// One verifier per 15-minute window (the magic-link TTL), reused by every
+  /// flow inside it. The auth view re-resolves the flow on retries, sign-out
+  /// and expiries; minting a new pair each time would overwrite the verifier an
+  /// outstanding link is bound to, and that link would fail its PKCE check.
+  Future<String> _beginFlowPkce() async {
+    final existing = await _pendingFlowVerifier();
+    if (existing != null && await _flowVerifierIsFresh()) {
+      _flowVerifier = existing;
+      return _generateCodeChallenge(existing);
+    }
+    final verifier = _generateCodeVerifier();
+    _flowVerifier = verifier;
+    try {
+      await _storage.write(key: _flowVerifierKey, value: verifier);
+      await _storage.write(
+          key: _flowVerifierIssuedAtKey, value: _clock().millisecondsSinceEpoch.toString());
+    } catch (e) {
+      // The in-memory copy still covers this process.
+      debugPrint('[OneloAuth] could not persist the flow verifier: $e');
+    }
+    return _generateCodeChallenge(verifier);
+  }
+
+  /// Fails closed: an unreadable stamp or a clock that moved backwards is stale.
+  Future<bool> _flowVerifierIsFresh() async {
+    try {
+      final raw = await _storage.read(key: _flowVerifierIssuedAtKey);
+      final issued = int.tryParse(raw ?? '');
+      if (issued == null) return false;
+      final age = _clock().millisecondsSinceEpoch - issued;
+      return age >= 0 && age < _flowVerifierLifetime.inMilliseconds;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// In memory while the app stayed alive, from storage after a relaunch.
+  Future<String?> _pendingFlowVerifier() async {
+    if (_flowVerifier != null) return _flowVerifier;
+    try {
+      return await _storage.read(key: _flowVerifierKey);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _clearFlowPkce() async {
+    _flowVerifier = null;
+    try {
+      await _storage.delete(key: _flowVerifierKey);
+      await _storage.delete(key: _flowVerifierIssuedAtKey);
+    } catch (_) {}
+  }
 
   /// Generates a PKCE verifier+challenge pair and registers the challenge with the
   /// backend by calling `/api/sdk/config`. The backend stores the challenge keyed
@@ -731,6 +1068,8 @@ class OneloAuth extends ChangeNotifier {
     final uri = Uri.parse('${_config.apiUrl}/api/sdk/config').replace(queryParameters: {
       'key': _config.publishableKey,
       'code_challenge': challenge,
+      // #818: the sign-up Marketing Consent text in the device language.
+      'lang': OneloSignupMarketingConsent.deviceLanguage(),
     });
     try {
       final response = await _httpClient.get(uri, headers: await _headers());
@@ -758,6 +1097,16 @@ class OneloAuth extends ChangeNotifier {
         _attestRequired = (data['attest_required'] as bool?) ?? false;
         final cpn = data['cloud_project_number'];
         _cloudProjectNumber = (cpn is num && cpn > 0) ? cpn.toInt() : null;
+        // #681 — the one brand-token model every view paints its chrome from;
+        // cached alongside the page background for the next cold start.
+        final brandTokens = OneloBrand.adopt(data);
+        if (brandTokens != null) {
+          try {
+            await _storage.write(key: 'onelo_brand_tokens', value: jsonEncode(brandTokens.toJson()));
+          } catch (e) {
+            debugPrint('[OneloAuth] brand tokens cache failed: $e');
+          }
+        }
         // #36 — branding page background (checkout_bg_color). Cache it so the
         // next cold start can paint the branded auto-login splash immediately.
         if (data['checkout_bg_color'] is String) {
@@ -776,6 +1125,7 @@ class OneloAuth extends ChangeNotifier {
         if (data['oauth_providers'] is List) {
           _oauthProviders = (data['oauth_providers'] as List).whereType<String>().toList();
         }
+        _signupMarketingConsent = OneloSignupMarketingConsent.fromConfig(data);
       }
     } catch (e) {
       debugPrint('[OneloAuth] PKCE registration failed: $e');
@@ -834,7 +1184,9 @@ class OneloAuth extends ChangeNotifier {
     bool publishableKeyHeader = false,
   }) async {
     final headers = <String, String>{
-      'X-Sdk-Version': oneloFlutterSdkVersion,
+      // Version + name (#122): signin/refresh/config are the requests whose
+      // version the dashboard captures.
+      ...oneloSdkIdentityHeaders,
       'X-Onelo-Instance-Id': await _instanceIdValue(),
       'X-Onelo-OS': _currentOS(),
     };
@@ -997,6 +1349,9 @@ class OneloAuth extends ChangeNotifier {
       queryParameters: {
         'key': _config.publishableKey,
         'callback_scheme': _config.callbackScheme,
+        // Binds the flow token to this install, and pairs a magic link the
+        // hosted page sends with a code (#540/#541).
+        'code_challenge': await _beginFlowPkce(),
       },
     );
     try {
@@ -1078,6 +1433,7 @@ class OneloAuth extends ChangeNotifier {
       queryParameters: {
         'key': _config.publishableKey,
         'callback_scheme': _config.callbackScheme,
+        'code_challenge': await _beginFlowPkce(),
       },
     );
     try {
@@ -1242,6 +1598,23 @@ class OneloAuth extends ChangeNotifier {
     _eventStream.start(userId: _currentSession!.user.id);
   }
 
+  /// A user in the backend's wire shape — what `_parseUser` reads back.
+  @visibleForTesting
+  static Map<String, dynamic> userWireMap(OneloUser user) => {
+        'id': user.id,
+        'email': user.email,
+        'role': switch (user.role) {
+          OneloUserRole.platformOwner => 'platform_owner',
+          OneloUserRole.creator => 'creator',
+          OneloUserRole.member => 'member',
+        },
+        'tenant_id': user.tenantId,
+        'entitlement': user.entitlement.name,
+        if (user.allowedIn != null) 'allowed_in': user.allowedIn,
+        if (user.emailVerified != null) 'email_verified': user.emailVerified,
+        if (user.accessReason != null) 'access_reason': user.accessReason,
+      };
+
   OneloUser _parseUser(Map<String, dynamic> map) => OneloUser(
         id: map['id'] as String,
         email: map['email'] as String?,
@@ -1251,7 +1624,12 @@ class OneloAuth extends ChangeNotifier {
         // Absent stays null — "the server did not say" and "the server said no"
         // are different answers, and only the first may fall back.
         allowedIn: map['allowed_in'] is bool ? map['allowed_in'] as bool : null,
+        emailVerified: map['email_verified'] is bool ? map['email_verified'] as bool : null,
+        accessReason: map['access_reason'] is String ? map['access_reason'] as String : null,
       );
+
+  @visibleForTesting
+  OneloUser parseUserForTesting(Map<String, dynamic> map) => _parseUser(map);
 
   OneloUserRole _parseRole(String role) {
     switch (role) {
@@ -1267,4 +1645,21 @@ class OneloAuth extends ChangeNotifier {
   /// Test-only: expose _saveSession for unit tests.
   @visibleForTesting
   Future<void> testSaveSession(Map<String, dynamic> data) => _saveSession(data);
+}
+
+/// Whether a refused `/api/sdk/auth/refresh` body is a BAN — the only refusal
+/// that is an account action. The backend answers
+/// `{"detail": {"error" | "error_code": …}}`; session_compromised /
+/// session_expired / session_invalid and no_plan_available are not bans.
+@visibleForTesting
+bool refreshRefusalIsBan(String body) {
+  try {
+    final json = jsonDecode(body);
+    if (json is! Map) return false;
+    final detail = json['detail'];
+    final code = detail is Map ? detail['error'] : json['error'];
+    return code == 'banned';
+  } catch (_) {
+    return false;
+  }
 }

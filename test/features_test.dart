@@ -204,14 +204,15 @@ void main() {
     List<(String, Map<String, dynamic>, Map<String, String>)> resolveCalls() =>
         posts.where((p) => p.$1.contains('/resolve')).toList();
 
-    test('resolve sends X-Onelo-Instance-Id + X-Sdk-Version + userId/userIdHash', () async {
+    test('resolve sends X-Onelo-Instance-Id + X-Sdk-Version + userId, never userIdHash', () async {
       final f = makeF();
+      // Secure Mode is retired (#519): a hash handed to load() is ignored.
       await f.load('u1', userIdHash: 'h1');
       final c = resolveCalls().single;
       expect(c.$3['X-Onelo-Instance-Id'], 'inst-1');
       expect(c.$3['X-Sdk-Version'], isNotEmpty);
       expect(c.$2['userId'], 'u1');
-      expect(c.$2['userIdHash'], 'h1');
+      expect(c.$2.containsKey('userIdHash'), isFalse);
     });
 
     test('resolve sends X-Bundle-Id when a bundle-id provider is wired', () async {
@@ -406,7 +407,7 @@ void main() {
       );
     });
 
-    test('moduleToken maps 401 secure_mode_required', () async {
+    test('moduleToken maps any 401 (even a retired secure_mode_required) to notAuthenticated', () async {
       when(() => http_.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
           .thenAnswer((inv) async {
         final url = inv.positionalArguments[0].toString();
@@ -420,7 +421,7 @@ void main() {
       await expectLater(
         f.moduleToken('gated'),
         throwsA(isA<OneloFeaturesException>()
-            .having((e) => e.kind, 'kind', OneloFeaturesErrorKind.secureModeRequired)),
+            .having((e) => e.kind, 'kind', OneloFeaturesErrorKind.notAuthenticated)),
       );
     });
 
@@ -445,6 +446,8 @@ void main() {
     test('SSE features_updated applies the snapshot to the cache and notifies', () async {
       final stream = makeStream();
       final f = makeFwithStream(stream);
+      await f.load(null); // anonymous identity; the stream is bound to anonymous too
+      stream.stop();
       var notified = false;
       f.addListener(() => notified = true);
       stream.debugEmit('features_updated', {
@@ -459,11 +462,17 @@ void main() {
       expect(notified, isTrue);
     });
 
-    test('SSE connected/up_to_date unblocks ready()', () async {
+    test('SSE version-only frame does not confirm; a snapshot frame does (#738)', () async {
+      when(() => http_.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => http.Response('down', 503));
       final stream = makeStream();
       final f = makeFwithStream(stream);
+      await f.load(null);
+      stream.stop();
       expect(f.isReady, isFalse);
       stream.debugEmit('connected', {'config_version': 3});
+      expect(f.isReady, isFalse);
+      stream.debugEmit('connected', {'config_version': 3, 'features': {}});
       await f.ready();
       expect(f.isReady, isTrue);
     });
@@ -474,6 +483,8 @@ void main() {
       // arrives here — the snapshot MUST be applied, not dropped.
       final stream = makeStream();
       final f = makeFwithStream(stream);
+      await f.load(null);
+      stream.stop();
       stream.debugEmit('connected', {
         'config_version': 9,
         'features': {

@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'auth.dart';
+import 'hand_back.dart';
+import 'brand_tokens.dart';
 
 /// Parse a hosted-flow callback deep link `<scheme>://callback?code=...`.
 ///
@@ -39,6 +41,20 @@ bool closingMeansSignOut(String? url) {
   return uri.queryParameters['exit'] == 'signout';
 }
 
+/// Before restarting on a spent addressing token, must the local session go?
+///
+/// Only when the user chose to leave: the ✕ and "Use a different account"
+/// report `invalid_token` after signing out server-side, and on an
+/// `exit=signout` surface re-resolving with the old session would reopen the
+/// same screen. A link that merely DIED (`token_expired`, #619 — the
+/// access-gate store outlived its link) is not a choice to leave: the user
+/// stays signed in and the restart brings the same store back on a fresh link.
+/// Mirrors `signOutBeforeRestart` in the JS and Swift SDKs.
+bool signOutBeforeRestart(String? error, String? url) {
+  if (error == 'token_expired' || error == 'expired_token') return false;
+  return closingMeansSignOut(url);
+}
+
 ({bool isCallback, String? code, bool expired}) parseAuthCallback(
     String url, String callbackScheme) {
   final uri = Uri.tryParse(url);
@@ -47,14 +63,15 @@ bool closingMeansSignOut(String? url) {
       uri.host != 'callback') {
     return (isCallback: false, code: null, expired: false);
   }
-  final code = uri.queryParameters['code'];
-  final error = uri.queryParameters['error'];
+  // The one Store Hand-back decoder (#615).
+  final hb = classifyHandBack(uri, callbackScheme);
   return (
     isCallback: true,
-    code: (code != null && code.isNotEmpty) ? code : null,
-    expired: error == 'invalid_token' ||
-        error == 'expired_token' ||
-        error == 'token_expired',
+    code: hb?.kind == HandBackKind.purchase ? hb!.code : null,
+    expired: hb?.kind == HandBackKind.error &&
+        (hb!.error == 'invalid_token' ||
+            hb.error == 'expired_token' ||
+            hb.error == 'token_expired'),
   );
 }
 
@@ -66,7 +83,7 @@ bool closingMeansSignOut(String? url) {
 /// divider are drawn only when the app has social providers, matching Swift's
 /// AuthSkeletonView (with-socials / without-socials). Distinct from the portal
 /// skeleton (subscription cards, not a sign-in form).
-String _authSkeletonHtml(int socials) {
+String _authSkeletonHtml(int socials, OneloBrandTokens t) {
   final pills = List.generate(
     socials.clamp(0, 4),
     (_) => '<div class="strong pill"></div>',
@@ -79,30 +96,28 @@ String _authSkeletonHtml(int socials) {
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
+body{background:${t.pageBg};font-family:${t.bodyFont};overflow:hidden}
+${t.skeletonCss}
 /* Center vertically to match the real hosted sign-in page (which is centered),
    so there's no jump from a top-aligned skeleton to a centered form. */
 .wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:24px}
 .col{width:100%;max-width:300px;display:flex;flex-direction:column;gap:10px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
 /* Logo box shimmers like every other placeholder (mirrors Swift's auth skeleton
    shimmerRect(64,64) — do NOT set a solid `background` here, it overrides .sk's
    animated gradient and leaves the logo static while the rest sweeps). */
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px;border-radius:4px}
-.pill{height:44px;border-radius:9px}
+.icon{width:64px;height:64px;border-radius:${t.cardRadius.round()}px;margin-bottom:14px}
+.title{width:200px;height:22px;margin-bottom:10px}
+.sub{width:140px;height:13px;opacity:0.7;margin-bottom:28px}
+.pill{height:44px;border-radius:${t.buttonRadius.round()}px}
 .divider{display:flex;align-items:center;gap:8px;margin:2px 0}
-.dline{flex:1;height:1px;background:rgba(255,255,255,0.1)}
+.dline{flex:1;height:1px;background:${t.border}}
 .dtext{width:22px;height:10px;border-radius:4px}
 .lbl{width:38px;height:11px;border-radius:4px}
-.input{height:44px;border-radius:9px}
+.input{height:44px}
 .lblrow{display:flex;justify-content:space-between;align-items:center}
 .lbl2{width:58px;height:11px;border-radius:4px}
 .forgot{width:90px;height:11px;opacity:0.7;border-radius:4px}
-.cta{height:48px;border-radius:10px;margin-top:6px}
+.cta{height:48px;border-radius:${t.buttonRadius.round()}px;margin-top:6px}
 .signup{width:200px;height:12px;opacity:0.6;border-radius:4px;margin:16px auto 0}
 .powered{width:150px;height:32px;border-radius:16px;opacity:0.4;margin:24px auto 0}
 </style></head><body>
@@ -145,6 +160,11 @@ class _OneloAuthViewState extends State<OneloAuthView> {
   WebViewController? _controller;
   bool _wasSignedIn = false;
   bool _refreshing = false;
+  /// A failed re-resolve must replace the consumed WebView with a retryable
+  /// state. [OneloAuth.refreshHostedUrl] intentionally retains the old URL on
+  /// failure, so [initiateError] alone cannot drive the view's normal
+  /// `hostedUrl == null` error branch.
+  String? _refreshError;
 
   /// The hosted URL currently loaded in the WebView (null = only the skeleton is
   /// showing). Guards against reloading the same URL on every auth notification.
@@ -157,6 +177,10 @@ class _OneloAuthViewState extends State<OneloAuthView> {
   /// OAuth-provider count the currently-loaded skeleton was rendered with (-1 =
   /// none yet). Lets us repaint the skeleton once providers become known.
   int _skeletonSocials = -1;
+
+  /// Brand tokens the loaded skeleton was painted with (#681) — a config that
+  /// lands after first paint repaints it in the app's colours.
+  OneloBrandTokens? _skeletonTokens;
 
   /// True when the WebView is currently showing the hosted STORE page ("Choose
   /// your plan"), which the hosted flow navigates to during Sign-Up when the
@@ -239,10 +263,11 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     final controller = _controller;
     if (url == null || url == _loadedUrl || controller == null) return;
     final count = _socialCount();
-    if (count != _skeletonSocials) {
+    if (count != _skeletonSocials || OneloBrand.current != _skeletonTokens) {
       _skeletonSocials = count;
+      _skeletonTokens = OneloBrand.current;
       _pendingUrl = url;
-      controller.loadHtmlString(_authSkeletonHtml(count));
+      controller.loadHtmlString(_authSkeletonHtml(count, OneloBrand.current));
       // Safety net: if the skeleton's onPageFinished never fires (platform
       // quirk), load the real URL anyway so we can't get stuck on the skeleton.
       Future.delayed(const Duration(seconds: 2), () {
@@ -263,12 +288,14 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     if (_refreshing) return;
     _refreshing = true;
     try {
+      _refreshError = null;
       // Instantly replace the stale sign-up form with the skeleton (correct pill
       // count — providers are known by now) so the old screen never flashes while
       // we fetch a fresh URL over the network.
       _pendingUrl = null;
       _skeletonSocials = _socialCount();
-      _controller?.loadHtmlString(_authSkeletonHtml(_socialCount()));
+      _skeletonTokens = OneloBrand.current;
+      _controller?.loadHtmlString(_authSkeletonHtml(_socialCount(), OneloBrand.current));
       _loadedUrl = null;
       final url = await widget.auth.refreshHostedUrl();
       if (!mounted) return;
@@ -279,8 +306,14 @@ class _OneloAuthViewState extends State<OneloAuthView> {
         _loadedUrl = url;
         _controller!.loadRequest(Uri.parse(url));
       }
-      // If the refetch failed (url == null / offline) the skeleton stays up
-      // rather than showing the consumed stale form — a clean degraded state.
+      if (url == null) {
+        // The old URL is deliberately retained by OneloAuth so callers never
+        // accidentally reload a consumed page. Surface the fetch failure here,
+        // where the view can offer a retry instead of leaving the dead page or
+        // an endless skeleton on screen.
+        _refreshError = widget.auth.initiateError ??
+            "Couldn't refresh sign-in. Please try again.";
+      }
       if (mounted) setState(() {});
     } finally {
       _refreshing = false;
@@ -355,7 +388,11 @@ class _OneloAuthViewState extends State<OneloAuthView> {
               // The surface the flow resolved to. It carries the marker because
               // /flow/init stamps it there; the WebView'''s own in-page
               // navigations do not change it.
-              final wasSignOutSurface = closingMeansSignOut(widget.auth.hostedUrl);
+              // A dead link (#619) keeps the session: only the user's own exit
+              // (`invalid_token`) signs out.
+              final wasSignOutSurface = signOutBeforeRestart(
+                  Uri.tryParse(req.url)?.queryParameters['error'],
+                  widget.auth.hostedUrl);
               if (wasSignOutSurface) {
                 // ignore: discarded_futures
                 widget.auth.signOut().catchError((Object e) {
@@ -368,14 +405,10 @@ class _OneloAuthViewState extends State<OneloAuthView> {
               // or an idle expiry). Without this the navigation was simply
               // prevented and the WebView froze on a dead page. Re-resolve a
               // FRESH hosted URL — /flow/init now answers `sign_in`, so the user
-              // lands on a clean form. Parity with Swift's onSessionExpired.
+              // lands on a clean form. If the re-resolve fails, the helper shows
+              // a retryable error instead of leaving the dead page in place.
               // ignore: discarded_futures
-              widget.auth.refreshHostedUrl().then((url) {
-                if (url != null && mounted) _controller?.loadRequest(Uri.parse(url));
-              }).catchError((Object e) {
-                debugPrint('[OneloAuthView] reload after expiry failed: $e');
-                return null;
-              });
+              _reloadFreshSignIn();
             }
             return NavigationDecision.prevent;
           }
@@ -425,8 +458,9 @@ class _OneloAuthViewState extends State<OneloAuthView> {
       // Paint the skeleton immediately (with whatever provider count is known so
       // far — repainted with the right pills once providers resolve). The real
       // hosted URL is loaded by _showHosted; re-loaded fresh on sign-out.
-      ..loadHtmlString(_authSkeletonHtml(_socialCount()));
+      ..loadHtmlString(_authSkeletonHtml(_socialCount(), OneloBrand.current));
     _skeletonSocials = _socialCount();
+    _skeletonTokens = OneloBrand.current;
   }
 
   void _injectBridge() {
@@ -492,52 +526,54 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     } catch (_) {}
   }
 
-  /// #30 — error state shown when the hosted sign-in URL can't be fetched. On the
-  /// dark branding background (matches the skeleton), with a "Try again" that
-  /// re-fetches via [OneloAuth.retryInitiate].
-  Widget _errorScaffold(String message) {
+  /// #30 — error state shown when the hosted sign-in URL can't be fetched, painted
+  /// from the brand tokens (#681), with a "Try again" that re-fetches via
+  /// [OneloAuth.retryInitiate].
+  Widget _errorScaffold(String message, {VoidCallback? onRetry}) {
+    final t = OneloBrand.current;
     return Scaffold(
-      backgroundColor: const Color(0xFF111111),
+      backgroundColor: t.pageBgColor,
       body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  message,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white, fontSize: 15, height: 1.4),
-                ),
-                const SizedBox(height: 20),
-                ElevatedButton(
-                  onPressed: () => widget.auth.retryInitiate(),
-                  child: const Text('Try again'),
-                ),
-              ],
-            ),
-          ),
+        child: OneloBrandedErrorView(
+          tokens: t,
+          message: message,
+          onPressed: onRetry ?? (() => widget.auth.retryInitiate()),
         ),
       ),
     );
   }
 
-  /// #36 — the branding page background (`checkout_bg_color`) as a Color, parsed
-  /// from the hex auth resolved/cached from `/api/sdk/config`. Accepts `#RRGGBB`
-  /// / `#AARRGGBB` (with or without `#`); defaults to the same dark `#111111`
-  /// used by the skeleton + error scaffold so an unbranded app still looks right.
-  Color _brandedBgColor() {
-    const fallback = Color(0xFF111111);
-    final hex = widget.auth.pageBackgroundColorHex;
-    if (hex == null) return fallback;
-    var h = hex.trim();
-    if (h.startsWith('#')) h = h.substring(1);
-    if (h.length == 6) h = 'FF$h';
-    if (h.length != 8) return fallback;
-    final value = int.tryParse(h, radix: 16);
-    return value == null ? fallback : Color(value);
+  /// Opaque "Signing you in…" cover over the hosted WebView (#666), on the
+  /// branding background so it reads as the same page, not a new screen.
+  Widget _signingInCover() {
+    final bg = _brandedBgColor();
+    // #681 — the token's muted text reads on its own page ground.
+    final fg = OneloBrand.current.textMutedColor;
+    return ColoredBox(
+      color: bg,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2, color: fg),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              'Signing you in…',
+              style: TextStyle(color: fg, fontSize: 15),
+            ),
+          ],
+        ),
+      ),
+    );
   }
+
+  /// #36/#681 — the branding page background: the brand tokens' `page_bg`
+  /// (restored from the cache on a cold start, neutral before any config).
+  Color _brandedBgColor() => OneloBrand.current.pageBgColor;
 
   @override
   Widget build(BuildContext context) {
@@ -573,6 +609,10 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     // an error + "Try again" instead of hanging forever on the skeleton (parity
     // with RN's OneloAuthGate retry screen).
     final initiateError = widget.auth.initiateError;
+    final refreshError = _refreshError;
+    if (refreshError != null) {
+      return _errorScaffold(refreshError, onRetry: _reloadFreshSignIn);
+    }
     if (initiateError != null && widget.auth.hostedUrl == null) {
       return _errorScaffold(initiateError);
     }
@@ -580,6 +620,8 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     final controller = _controller;
     if (controller == null) return const Scaffold();
     return Scaffold(
+      // #681 — the brand page ground behind the WebView (no white flash).
+      backgroundColor: _brandedBgColor(),
       body: SafeArea(
         child: Stack(
           children: [
@@ -594,10 +636,19 @@ class _OneloAuthViewState extends State<OneloAuthView> {
                 top: 8,
                 right: 8,
                 child: IconButton(
-                  icon: const Icon(Icons.close, color: Colors.white),
+                  icon: Icon(Icons.close, color: OneloBrand.current.textColor),
                   onPressed: _closeStore,
                 ),
               ),
+            // #666 — a social sign-in came back from the provider's system
+            // browser and its code is being exchanged. The hosted page never
+            // learns that (the provider ran outside it), so without this cover
+            // the idle form sat on screen for the whole round trip and read as
+            // a failed sign-in. Same words as the hosted page's own pending
+            // state on the web (#543). Lifted on success (the app replaces this
+            // view) and on failure (the form is usable again).
+            if (widget.auth.isCompletingSignIn)
+              Positioned.fill(child: _signingInCover()),
           ],
         ),
       ),

@@ -66,14 +66,44 @@ const String kOneloReadyRelaySource = '''
 })();
 ''';
 
+/// #613 / #614 — relays the hosted portal's `onelo:renew_request` (its token
+/// died; it wants a fresh portal) to the native `oneloRenewPortal` handler, and
+/// posts the handler's reply back into the page. The page trusts only a
+/// self-post (event.source === window), which is what this produces. A request
+/// the page made before the platform bridge was ready is parked on
+/// `window.__oneloRenewPending` and forwarded once it is.
+const String kOneloRenewRelaySource = '''
+(function () {
+  try {
+    function renew(d) {
+      if (!d || d.type !== 'onelo:renew_request' || d.kind !== 'portal' || typeof d.request_id !== 'string') return;
+      if (!window.flutter_inappwebview || !window.flutter_inappwebview.callHandler) return;
+      window.flutter_inappwebview.callHandler('oneloRenewPortal', d.request_id).then(function (reply) {
+        if (reply) window.postMessage(reply, '*');
+      });
+    }
+    window.addEventListener('message', function (e) {
+      if (!e || e.source !== window) return;
+      var d = e.data;
+      if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) { return; } }
+      renew(d);
+    });
+    window.addEventListener('flutterInAppWebViewPlatformReady', function () {
+      if (window.__oneloRenewPending) renew(window.__oneloRenewPending);
+    });
+  } catch (e) {}
+})();
+''';
+
 /// The document-start user script(s) that install [kOneloWebViewBridgeSource].
 /// Pass to `InAppWebView(initialUserScripts: oneloBridgeUserScripts())`.
 ///
 /// [withReadyRelay] additionally installs [kOneloReadyRelaySource], forwarding
 /// the hosted page's `onelo:ready` signal to the `oneloReady` handler — used by
 /// the Customer Portal (whose hosted page renders the canonical ✕). The store
-/// doesn't need it (it renders no hosted ✕), so it's opt-in.
-UnmodifiableListView<UserScript> oneloBridgeUserScripts({bool withReadyRelay = false}) =>
+/// posts `onelo:ready` as well (#682); `OneloStoreView` keeps its always-on ✕
+/// and does not listen, so the relay stays opt-in.
+UnmodifiableListView<UserScript> oneloBridgeUserScripts({bool withReadyRelay = false, bool withRenewRelay = false}) =>
     UnmodifiableListView<UserScript>([
       UserScript(
         source: kOneloWebViewBridgeSource,
@@ -82,6 +112,11 @@ UnmodifiableListView<UserScript> oneloBridgeUserScripts({bool withReadyRelay = f
       if (withReadyRelay)
         UserScript(
           source: kOneloReadyRelaySource,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      if (withRenewRelay)
+        UserScript(
+          source: kOneloRenewRelaySource,
           injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
         ),
     ]);
@@ -119,4 +154,34 @@ void registerOneloReadyHandler(
       return null;
     },
   );
+}
+
+/// #613 / #614 — registers the `oneloRenewPortal` handler that
+/// [kOneloRenewRelaySource] calls. [renew] mints a fresh portal and returns the
+/// reply the relay posts back into the page. Call from
+/// `InAppWebView(onWebViewCreated: …)` with `withRenewRelay: true`.
+void registerOneloRenewHandler(
+  InAppWebViewController controller,
+  Future<Map<String, dynamic>?> Function(String requestId) renew,
+) {
+  controller.addJavaScriptHandler(
+    handlerName: 'oneloRenewPortal',
+    callback: (args) async {
+      final id = args.isEmpty ? null : args.first?.toString();
+      if (id == null || id.isEmpty) return null;
+      return renew(id);
+    },
+  );
+}
+
+/// True when [current] (the WebView's URL) shares scheme, host and port with
+/// [portalUrl]. A fresh portal is a bearer credential, so the portal view
+/// answers a renew request only while it is still on the portal's origin (#614).
+bool oneloSameOrigin(Uri? current, String? portalUrl) {
+  if (current == null || portalUrl == null) return false;
+  final p = Uri.tryParse(portalUrl);
+  if (p == null || current.host.isEmpty) return false;
+  return current.scheme.toLowerCase() == p.scheme.toLowerCase() &&
+      current.host.toLowerCase() == p.host.toLowerCase() &&
+      current.port == p.port;
 }

@@ -190,16 +190,20 @@ class UpgradeHint {
 
 /// Failure kinds for [OneloFeaturesException] — mirrors Swift `OneloFeaturesError`.
 enum OneloFeaturesErrorKind {
-  /// No identified user (call `onelo.identify(userId)` or sign in first).
+  /// No signed-in user, or their access token was refused even after a refresh.
   notAuthenticated,
 
   /// The user's plan/status doesn't grant this module (backend 403).
   notEntitled,
 
-  /// The app has Secure Mode on but no `userIdHash` was provided.
+  /// Never thrown: Secure Mode is retired and the server no longer answers
+  /// with it (#519). Kept so existing code compiles.
+  @Deprecated('Secure Mode is retired; the server no longer returns this.')
   secureModeRequired,
 
-  /// The provided `userIdHash` failed verification.
+  /// Never thrown: Secure Mode is retired and the server no longer answers
+  /// with it (#519). Kept so existing code compiles.
+  @Deprecated('Secure Mode is retired; the server no longer returns this.')
   invalidUserHash,
 
   /// Network / transport / unexpected server error.
@@ -318,6 +322,18 @@ class OneloUser {
   /// then may the legacy derivation stand in — see [OneloAuth.isAllowedIn].
   final bool? allowedIn;
 
+  /// Has this user proved their address receives mail (Email Verification,
+  /// #819)? From the backend's `email_verified`; `null` when an older backend
+  /// did not send it. OAuth, Magic Link and an e-mailed password reset count as
+  /// verified.
+  final bool? emailVerified;
+
+  /// Why [allowedIn] is `false`, when the server named a reason the app may
+  /// branch on. Today only `'email_unverified'`: the parent App requires Email
+  /// Verification and this user has not opened the link yet. `null` when
+  /// allowed in or when the reason is the paywall. Tolerate unknown values.
+  final String? accessReason;
+
   const OneloUser({
     required this.id,
     this.email,
@@ -325,7 +341,101 @@ class OneloUser {
     this.tenantId,
     this.entitlement = OneloEntitlement.none,
     this.allowedIn,
+    this.emailVerified,
+    this.accessReason,
   });
+
+  /// The server's access answer from a `/api/sdk/auth/user` body merged over
+  /// this user (#819): [allowedIn], [emailVerified] and [accessReason] move
+  /// together. A field the body does not carry keeps its stored value; when the
+  /// body carries `allowed_in`, [accessReason] is taken from the body even when
+  /// absent — the answer is complete and an old reason must not outlive it.
+  OneloUser mergingAccessAnswer(Map<String, dynamic> body, OneloEntitlement entitlement) {
+    final answered = body['allowed_in'] is bool;
+    return OneloUser(
+      id: id,
+      email: email,
+      role: role,
+      tenantId: tenantId,
+      entitlement: entitlement,
+      allowedIn: answered ? body['allowed_in'] as bool : allowedIn,
+      emailVerified: body['email_verified'] is bool ? body['email_verified'] as bool : emailVerified,
+      accessReason: answered ? (body['access_reason'] is String ? body['access_reason'] as String : null) : accessReason,
+    );
+  }
+}
+
+/// The result of [OneloAuth.resendVerificationEmail] (#819).
+class OneloVerificationResend {
+  /// A new e-mail went out; the previous link stopped working.
+  final bool sent;
+
+  /// The address was already verified, so nothing was sent.
+  final bool emailVerified;
+
+  const OneloVerificationResend({required this.sent, required this.emailVerified});
+}
+
+/// Why an Email Verification call was refused (#819).
+enum OneloVerificationErrorKind {
+  /// At most 3 verification e-mails an hour.
+  rateLimited,
+
+  /// Email verification is Off for this App (Auth → Sign-up on the parent App).
+  verificationOff,
+
+  /// The verification link was used, replaced by a newer one, or expired.
+  invalidToken,
+
+  /// `redirectTo` is not an allowed web origin nor `<registered-scheme>://…`.
+  invalidRedirect,
+
+  /// No signed-in user.
+  notAuthenticated,
+
+  /// Anything else (server or network).
+  serverError,
+}
+
+/// Thrown by [OneloAuth.resendVerificationEmail] and [OneloAuth.confirmEmail].
+class OneloVerificationException implements Exception {
+  final OneloVerificationErrorKind kind;
+  final String message;
+  const OneloVerificationException(this.kind, this.message);
+
+  /// What a refused Email Verification call means.
+  factory OneloVerificationException.fromResponse(int status, Map<String, dynamic> body) {
+    final detail = body['detail'];
+    final code = body['error'] is String
+        ? body['error'] as String
+        : (detail is Map && detail['error'] is String)
+            ? detail['error'] as String
+            : (detail is String ? detail : null);
+    if (status == 429 || code == 'verification_rate_limited') {
+      return const OneloVerificationException(
+          OneloVerificationErrorKind.rateLimited, 'At most 3 verification emails an hour — try again later');
+    }
+    if (status == 409 || code == 'email_verification_off') {
+      return const OneloVerificationException(OneloVerificationErrorKind.verificationOff,
+          'Email verification is off for this app — turn it on in Auth → Sign-up');
+    }
+    if (status == 400 && code == 'invalid_verify_redirect_to') {
+      return const OneloVerificationException(OneloVerificationErrorKind.invalidRedirect,
+          "redirectTo must be one of this app's allowed web origins or <your-scheme>://…");
+    }
+    if (status == 400 && code == 'invalid_token') {
+      return const OneloVerificationException(OneloVerificationErrorKind.invalidToken,
+          'This verification link is invalid, already used, replaced by a newer one, or expired');
+    }
+    if (status == 401) {
+      return const OneloVerificationException(OneloVerificationErrorKind.notAuthenticated, 'User is not authenticated');
+    }
+    return OneloVerificationException(
+        OneloVerificationErrorKind.serverError, 'Email verification request failed: HTTP $status');
+  }
+
+  @override
+  String toString() => 'OneloVerificationException(${kind.name}): $message';
 }
 
 class OneloSession {

@@ -87,4 +87,38 @@ void main() {
     },
     timeout: const Timeout(Duration(seconds: 8)),
   );
+
+  test(
+    'the Publishable Key travels as a header, never in the Event Stream URL',
+    () async {
+      // ADR-0003: the credential is an `X-Publishable-Key` request header for
+      // every SDK but browser JS, so it stays out of the reverse proxy's
+      // access.log. A key in the query string would also earn the connection
+      // RFC 8594 Deprecation/Sunset headers from the backend.
+      final client = _MockClient();
+      final body = StreamController<List<int>>();
+      when(() => client.send(any())).thenAnswer(
+        (_) async => http.StreamedResponse(body.stream, 200),
+      );
+
+      final stream = make(client);
+      stream.ensureStarted(userId: 'u1');
+      await settle();
+
+      final captured =
+          verify(() => client.send(captureAny())).captured.single as http.BaseRequest;
+
+      expect(captured.headers['X-Publishable-Key'], 'onelo_pk_test_x');
+      expect(captured.url.queryParameters.containsKey('key'), isFalse);
+      expect(captured.url.toString(), isNot(contains('onelo_pk_test_x')));
+      // The rest of the query string is untouched.
+      expect(captured.url.queryParameters['userId'], 'u1');
+      expect(captured.url.queryParameters['instance_id'], 'inst-1');
+      expect(captured.url.queryParameters['sdk_platform'], 'flutter');
+
+      stream.stop();
+      unawaited(body.close());
+    },
+    timeout: const Timeout(Duration(seconds: 8)),
+  );
 }

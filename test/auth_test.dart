@@ -1,12 +1,16 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:mocktail/mocktail.dart';
 import 'package:onelo/src/auth.dart';
+import 'package:onelo/src/marketing_consent.dart';
 import 'package:onelo/src/auth_view.dart';
 import 'package:onelo/src/types.dart';
+import 'package:onelo/src/version.dart';
 
 // ── Fakes & Mocks ─────────────────────────────────────────────────────────────
 
@@ -190,6 +194,37 @@ Map<String, dynamic> _nestedSessionResponse({
 void main() {
   setUpAll(() => registerFallbackValue(FakeUri()));
 
+  group('OneloAuth — Marketing Consent at sign-up (#818)', () {
+    test('asks /config in the device language, exposes the question, and signUp sends the ticked consent', () async {
+      final mock = MockHttpClient();
+      final configUris = <Uri>[];
+      final bodies = <Map<String, dynamic>>[];
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((inv) async {
+        final uri = inv.positionalArguments.first as Uri;
+        if (uri.path.endsWith('/api/sdk/config')) configUris.add(uri);
+        return http.Response(
+            '{"allow_custom_branding":true,"action":"present","surface":"sign_in","url":"https://example.com/auth",'
+            '"signup_marketing_consent":{"asked":true,"text":"Nowosci od Turingo.","language":"pl"}}',
+            200);
+      });
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body'))).thenAnswer((inv) async {
+        bodies.add(jsonDecode(inv.namedArguments[#body] as String) as Map<String, dynamic>);
+        return http.Response('{"error":"stop here"}', 400);
+      });
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(configUris.first.queryParameters['lang'], isNotEmpty);
+      expect(auth.signupMarketingConsent,
+          const OneloSignupMarketingConsent(asked: true, text: 'Nowosci od Turingo.', language: 'pl'));
+
+      await expectLater(auth.signUp('a@b.c', 'Passw0rd!x', marketingConsent: true), throwsException);
+      await expectLater(auth.signUp('b@b.c', 'Passw0rd!x'), throwsException);
+      expect(bodies[0]['marketing_consent'], isTrue);
+      expect(bodies[0]['lang'], 'pl');
+      expect(bodies[1].containsKey('marketing_consent'), isFalse);
+    });
+  });
+
   group('OneloAuth.initialize()', () {
     test('sets isReady=true and restores no session when storage empty', () async {
       final mock = MockHttpClient();
@@ -210,6 +245,21 @@ void main() {
       expect(auth.currentSession, isNull);
       expect(auth.hostedUrl, equals('https://example.com/auth'));
       expect(auth.hostedAppName, equals('TestApp'));
+    });
+
+    test('#122 — every auth request names the SDK next to its version', () async {
+      final mock = MockHttpClient();
+      Map<String, String>? seen;
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((inv) async {
+        seen = (inv.namedArguments[#headers] as Map).cast<String, String>();
+        return http.Response('{"action":"present","surface":"sign_in","url":"https://example.com/auth"}', 200);
+      });
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(seen, isNotNull);
+      expect(seen!['X-Sdk-Version'], oneloFlutterSdkVersion);
+      // The registry key — the dashboard used to guess it from app_type.
+      expect(seen!['X-Onelo-Sdk-Name'], 'onelo-flutter');
     });
 
     test('#30 — a 403 fetching the hosted URL surfaces initiateError (no silent skeleton hang), and retry clears it', () async {
@@ -237,6 +287,49 @@ void main() {
       await auth.retryInitiate();
       expect(auth.initiateError, isNull);
       expect(auth.hostedUrl, equals('https://example.com/auth'));
+    });
+
+    // #625 — the hosted page found its `art_` flow token dead and handed back
+    // `<scheme>://callback?error=token_expired`. OneloAuthView reloads whatever
+    // refreshHostedUrl returns, so it must be a NEW /flow/init URL — and null
+    // when the fetch failed, so the view never reloads the dead page.
+    test('#625 — refreshHostedUrl returns a NEW flow URL after the old token died', () async {
+      final mock = MockHttpClient();
+      final urls = [
+        'https://st.onelo.tools/auth/hosted?token=art_old',
+        'https://st.onelo.tools/auth/hosted?token=art_new',
+      ];
+      var flowInits = 0;
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response(
+              jsonEncode({'action': 'present', 'surface': 'sign_in', 'url': urls[flowInits++]}), 200));
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"allow_custom_branding":false}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+      expect(auth.hostedUrl, urls[0]);
+
+      final fresh = await auth.refreshHostedUrl();
+      expect(fresh, urls[1]);
+      expect(auth.hostedUrl, urls[1]);
+      expect(flowInits, 2);
+    });
+
+    test('#625 — refreshHostedUrl returns null when /flow/init fails (the dead page is never reloaded)', () async {
+      final mock = MockHttpClient();
+      var flowInits = 0;
+      when(() => mock.get(any(that: predicate<Uri>((u) => u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => flowInits++ == 0
+              ? http.Response('{"action":"present","surface":"sign_in","url":"https://st.onelo.tools/auth/hosted?token=art_old"}', 200)
+              : http.Response('{"error":"server"}', 500));
+      when(() => mock.get(any(that: predicate<Uri>((u) => !u.path.contains('/flow/init'))), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"allow_custom_branding":false}', 200));
+      final auth = OneloAuth(config: _config(), storage: FakeSecureStorage(), httpClient: mock);
+      await auth.initialize();
+
+      expect(await auth.refreshHostedUrl(), isNull);
+      expect(auth.initiateError, contains('temporarily unavailable'));
+      expect(flowInits, 2);
     });
 
     test('restores session from storage when tokens are present and not expired', () async {
@@ -400,7 +493,90 @@ void main() {
       expect(auth.hasActiveAccess, isTrue, reason: 'entitlement parsed from nested user');
     });
 
-    test('401 clears the session and marks it revoked', () async {
+    test('401 session_compromised clears the session but is NOT a revocation (#548)', () async {
+      final storage = FakeSecureStorage();
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"hosted_url":"","app_name":"App"}', 200));
+      final responses = <http.Response>[
+        http.Response(jsonEncode(_sessionResponse()), 200),
+        http.Response('{"detail":{"error":"session_compromised"}}', 401),
+      ];
+      var i = 0;
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => responses[i++]);
+
+      final auth = OneloAuth(config: _config(), storage: storage, httpClient: mock);
+      await auth.initialize();
+      await auth.exchangeCode('code');
+      await auth.refreshSession();
+      expect(auth.currentSession, isNull);
+      expect(auth.isUserRevoked, isFalse, reason: 'an ended session is neutral, never "revoked"');
+      expect(await storage.read(key: 'onelo_access_token'), isNull);
+    });
+
+    test('403 banned clears the session and marks it revoked', () async {
+      final storage = FakeSecureStorage();
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"hosted_url":"","app_name":"App"}', 200));
+      final responses = <http.Response>[
+        http.Response(jsonEncode(_sessionResponse()), 200),
+        http.Response('{"detail":{"error":"banned"}}', 403),
+      ];
+      var i = 0;
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => responses[i++]);
+
+      final auth = OneloAuth(config: _config(), storage: storage, httpClient: mock);
+      await auth.initialize();
+      await auth.exchangeCode('code');
+      await auth.refreshSession();
+      expect(auth.currentSession, isNull);
+      expect(auth.isUserRevoked, isTrue);
+    });
+
+    test('refreshRefusalIsBan: only banned is a ban', () {
+      expect(refreshRefusalIsBan('{"detail":{"error":"banned"}}'), isTrue);
+      for (final code in ['session_compromised', 'session_expired', 'session_invalid']) {
+        expect(refreshRefusalIsBan('{"detail":{"error":"$code"}}'), isFalse, reason: code);
+      }
+      expect(refreshRefusalIsBan('{"detail":{"error_code":"no_plan_available"}}'), isFalse);
+      expect(refreshRefusalIsBan('<html>'), isFalse);
+    });
+
+    test('transient retry backs off; the first lands inside the 30 s server grace window', () {
+      expect(OneloAuth.refreshRetryDelay(0), const Duration(seconds: 5));
+      expect(OneloAuth.refreshRetryDelay(0), lessThan(const Duration(seconds: 30)));
+      expect(OneloAuth.refreshRetryDelay(1), const Duration(seconds: 10));
+      expect(OneloAuth.refreshRetryDelay(3), const Duration(seconds: 40));
+      expect(OneloAuth.refreshRetryDelay(9), const Duration(seconds: 60));
+    });
+
+    test('503 refresh_unavailable keeps the session (not cleared, not revoked)', () async {
+      final storage = FakeSecureStorage();
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{"hosted_url":"","app_name":"App"}', 200));
+      final responses = <http.Response>[
+        http.Response(jsonEncode(_sessionResponse()), 200),
+        http.Response('{"detail":{"error":"refresh_unavailable"}}', 503),
+      ];
+      var i = 0;
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) async => responses[i++]);
+
+      final auth = OneloAuth(config: _config(), storage: storage, httpClient: mock);
+      await auth.initialize();
+      await auth.exchangeCode('code');
+      await auth.refreshSession();
+      expect(auth.currentSession, isNotNull);
+      expect(auth.isUserRevoked, isFalse);
+      expect(await storage.read(key: 'onelo_refresh_token'), isNotNull);
+      auth.dispose();
+    });
+
+    test('401 session_invalid clears the session (legacy flat body)', () async {
       final storage = FakeSecureStorage();
       final mock = MockHttpClient();
       when(() => mock.get(any(), headers: any(named: 'headers')))
@@ -419,7 +595,7 @@ void main() {
       expect(auth.currentSession, isNotNull);
       await auth.refreshSession();
       expect(auth.currentSession, isNull);
-      expect(auth.isUserRevoked, isTrue);
+      expect(auth.isUserRevoked, isFalse);
       expect(await storage.read(key: 'onelo_access_token'), isNull);
     });
 
@@ -942,6 +1118,81 @@ void main() {
           headers: any(named: 'headers'),
           body: captureAny(named: 'body'))).captured.single as String;
       expect(jsonDecode(call), isNot(contains('code_challenge')));
+    });
+  });
+  // #666 — the native social sign-in return. The provider runs in a system
+  // browser (ASWebAuthenticationSession / Custom Tabs), so the hosted page in
+  // the WebView never learns that it finished: when that browser closes, the
+  // idle sign-in form sits uncovered for the whole /hosted-callback round trip
+  // and reads as a failed sign-in. `isCompletingSignIn` is what the view covers
+  // it with.
+  group('OneloAuth.signInWithOAuth() — completing the native return (#666)', () {
+    MockHttpClient mockFor(Future<http.Response> Function() hostedCallback) {
+      final mock = MockHttpClient();
+      // One GET answer serves /api/sdk/config (PKCE registration) and the
+      // provider init (`url`).
+      when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async =>
+          http.Response('{"hosted_url":"","app_name":"App","url":"https://accounts.google.com/o/oauth2/auth"}', 200));
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+          .thenAnswer((_) => hostedCallback());
+      return mock;
+    }
+
+    test('is set from the provider return until the session lands', () async {
+      final exchange = Completer<http.Response>();
+      final auth = OneloAuth(
+          config: _config(), storage: FakeSecureStorage(), httpClient: mockFor(() => exchange.future));
+      await auth.initialize();
+      auth.webAuthenticate = ({required url, required callbackUrlScheme}) async =>
+          'myapp://callback?code=oac_1';
+
+      final seen = <bool>[];
+      auth.addListener(() => seen.add(auth.isCompletingSignIn));
+      final signIn = auth.signInWithOAuth('google');
+      // Let the provider return and the exchange start.
+      await pumpEventQueue();
+
+      // The bug: nothing said "signing in" here, so the view kept showing the
+      // idle form while this request was in flight.
+      expect(auth.currentSession, isNull);
+      expect(auth.isCompletingSignIn, isTrue);
+      expect(seen, contains(true), reason: 'the view must be notified to cover the form');
+
+      exchange.complete(http.Response(jsonEncode(_sessionResponse()), 200));
+      await signIn;
+      expect(auth.currentSession, isNotNull);
+      expect(auth.isCompletingSignIn, isFalse);
+    });
+
+    test('is cleared when the exchange fails, so the form comes back', () async {
+      final auth = OneloAuth(
+          config: _config(),
+          storage: FakeSecureStorage(),
+          httpClient: mockFor(() async => http.Response('{"error":"invalid code"}', 400)));
+      await auth.initialize();
+      auth.webAuthenticate = ({required url, required callbackUrlScheme}) async =>
+          'myapp://callback?code=oac_1';
+
+      await expectLater(auth.signInWithOAuth('google'), throwsException);
+      expect(auth.isCompletingSignIn, isFalse);
+      expect(auth.currentSession, isNull);
+    });
+
+    test('is never set when the user closes the provider window', () async {
+      final auth = OneloAuth(
+          config: _config(),
+          storage: FakeSecureStorage(),
+          httpClient: mockFor(() async => http.Response(jsonEncode(_sessionResponse()), 200)));
+      await auth.initialize();
+      // flutter_web_auth_2 throws PlatformException(CANCELED) on a closed window.
+      auth.webAuthenticate = ({required url, required callbackUrlScheme}) async =>
+          throw PlatformException(code: 'CANCELED');
+
+      final seen = <bool>[];
+      auth.addListener(() => seen.add(auth.isCompletingSignIn));
+      await expectLater(auth.signInWithOAuth('google'), throwsA(isA<PlatformException>()));
+      expect(seen, isNot(contains(true)));
+      expect(auth.isCompletingSignIn, isFalse);
     });
   });
 }

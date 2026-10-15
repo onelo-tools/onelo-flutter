@@ -416,6 +416,8 @@ class OneloMonitor {
           ok: false,
           error: details.exceptionAsString(),
           source: 'global_error',
+          // meta.origin: whose error this is (#548) — see errorOriginOf.
+          meta: {'origin': errorOriginOf(details.stack)},
           stack: details.stack,
           errorType: details.exception.runtimeType.toString(),
         );
@@ -436,6 +438,7 @@ class OneloMonitor {
           ok: false,
           error: error.toString(),
           source: 'global_error',
+          meta: {'origin': errorOriginOf(stack)},
           stack: stack,
           errorType: error.runtimeType.toString(),
         );
@@ -797,4 +800,27 @@ class OneloMonitor {
     }
     _destroyed = true;
   }
+}
+
+/// Whose error is an uncaught error — the app's or the Onelo SDK's (#548)?
+/// Sent as `meta.origin` so the backend keeps the SDK's own errors out of the
+/// developer's Monitor data. The first frame outside the Dart/Flutter runtime
+/// (where the error was thrown from code someone wrote) decides:
+/// `package:onelo/` → `onelo_sdk`. A release AOT build prints non-symbolic
+/// frames (addresses only) — those classify as `app`.
+@visibleForTesting
+String errorOriginOf(StackTrace? stack) {
+  if (stack == null) return 'app';
+  final uri = RegExp(r'\((\S+?):\d+(?::\d+)?\)|^(\S+?\.dart)\s');
+  for (final line in stack.toString().split('\n')) {
+    final m = uri.firstMatch(line.trim().replaceFirst(RegExp(r'^#\d+\s+\S+\s+'), ''));
+    final loc = m == null ? null : (m.group(1) ?? m.group(2));
+    if (loc == null) continue;
+    if (loc.startsWith('dart:') || loc.startsWith('package:flutter/') ||
+        loc.startsWith('package:stack_trace/')) {
+      continue;
+    }
+    return loc.startsWith('package:onelo/') ? 'onelo_sdk' : 'app';
+  }
+  return 'app';
 }

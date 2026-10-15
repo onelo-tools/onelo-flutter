@@ -4,6 +4,35 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'store.dart';
 import 'webview_bridge.dart';
+import 'hand_back.dart';
+import 'brand_tokens.dart';
+
+/// What the store view does with a `<scheme>://callback` hand-back.
+enum StoreHandBackAction {
+  /// A purchase: exchange its code, then close.
+  exchangeAndClose,
+
+  /// The store's link died (#619): mint a fresh one through store-initiate
+  /// and load it in place, so the buyer continues.
+  reload,
+
+  /// Every other terminal (plan switch, portal ✕, other error): close. A plan
+  /// switch is reported so the SDK reconciles the plan at once (#659).
+  close,
+}
+
+/// The store view's one decision on a hand-back. Pure, so it is testable
+/// without a WebView.
+StoreHandBackAction storeHandBackAction(HandBack? hb) {
+  if (hb?.kind == HandBackKind.purchase && hb?.code != null) {
+    return StoreHandBackAction.exchangeAndClose;
+  }
+  if (hb?.kind == HandBackKind.error &&
+      (hb?.error == 'token_expired' || hb?.error == 'expired_token')) {
+    return StoreHandBackAction.reload;
+  }
+  return StoreHandBackAction.close;
+}
 
 /// Full-screen widget that presents the Onelo hosted Store IN AN IN-APP WEBVIEW and
 /// hands ONLY the Stripe CARD page off to the SYSTEM BROWSER — a 1:1 port of Swift's
@@ -102,16 +131,31 @@ class _OneloStoreViewState extends State<OneloStoreView> {
     final scheme = uri.scheme.toLowerCase();
 
     if (scheme == widget.store.callbackScheme.toLowerCase() && uri.host == 'callback') {
-      final code = uri.queryParameters['code'];
-      if (!_codeHandled && code != null && code.isNotEmpty) {
-        _codeHandled = true;
-        // ignore: discarded_futures
-        widget.store.exchangeCode(code).catchError((Object e) {
-          debugPrint('[OneloStoreView] code exchange failed: $e');
-        });
+      // The one Store Hand-back decoder (#615). A purchase exchanges its code;
+      // every other terminal (plan switch, portal ✕, error) closes, and a
+      // plan switch is reported so the plan is reconciled at once (#659).
+      final hb = classifyHandBack(uri, widget.store.callbackScheme);
+      switch (storeHandBackAction(hb)) {
+        case StoreHandBackAction.reload:
+          // ignore: discarded_futures
+          _reloadFresh(controller);
+          return NavigationActionPolicy.CANCEL;
+        case StoreHandBackAction.exchangeAndClose:
+          if (!_codeHandled) {
+            _codeHandled = true;
+            // ignore: discarded_futures
+            widget.store.exchangeCode(hb!.code!).catchError((Object e) {
+              debugPrint('[OneloStoreView] code exchange failed: $e');
+            });
+          }
+          _dismiss();
+          return NavigationActionPolicy.CANCEL;
+        case StoreHandBackAction.close:
+          // A code-less plan switch moved the plan: reconcile now (#659).
+          if (hb?.kind == HandBackKind.switched) widget.store.reportSwitch(hb!.reason ?? '');
+          _dismiss();
+          return NavigationActionPolicy.CANCEL;
       }
-      _dismiss();
-      return NavigationActionPolicy.CANCEL;
     }
 
     // THE CARD PAGE → system browser. The hosted store navigates to the Stripe
@@ -137,6 +181,20 @@ class _OneloStoreViewState extends State<OneloStoreView> {
       }
     }
     return NavigationActionPolicy.ALLOW;
+  }
+
+  /// The store's link died (#619): load a fresh store in the same WebView. A
+  /// link that cannot be minted closes the view, as before.
+  Future<void> _reloadFresh(InAppWebViewController controller) async {
+    try {
+      final url = await widget.store.initiateStoreFlow(lang: widget.lang);
+      if (!mounted || _dismissed) return;
+      _hostedHost = Uri.tryParse(url)?.host;
+      await controller.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+    } catch (e) {
+      debugPrint('[OneloStoreView] store renewal failed: $e');
+      _dismiss();
+    }
   }
 
   /// The Stripe payment surface — the Onelo-branded card page (`/store/pay`,
@@ -169,8 +227,17 @@ class _OneloStoreViewState extends State<OneloStoreView> {
 
   @override
   Widget build(BuildContext context) {
+    // #681 — every piece of chrome from the brand tokens; rebuilt when an
+    // initiate response refreshes them.
+    return ValueListenableBuilder<OneloBrandTokens>(
+      valueListenable: OneloBrand.notifier,
+      builder: (context, t, _) => _buildChrome(t),
+    );
+  }
+
+  Widget _buildChrome(OneloBrandTokens t) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: t.pageBgColor,
       body: SafeArea(
         child: Stack(
           children: [
@@ -200,35 +267,21 @@ class _OneloStoreViewState extends State<OneloStoreView> {
               ),
 
             if (_storeUrl == null && _errorMessage == null)
-              const Center(child: CircularProgressIndicator(color: Colors.white)),
+              Center(child: CircularProgressIndicator(color: t.brandColor, backgroundColor: t.spinnerTrackColor)),
 
             if (_errorMessage != null)
-              Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        _errorMessage!,
-                        style: const TextStyle(color: Colors.white),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 16),
-                      TextButton(
-                        onPressed: _dismiss,
-                        child: const Text('Close', style: TextStyle(color: Colors.white)),
-                      ),
-                    ],
-                  ),
-                ),
+              OneloBrandedErrorView(
+                tokens: t,
+                message: _errorMessage!,
+                buttonLabel: 'Close',
+                onPressed: _dismiss,
               ),
 
             Positioned(
               top: 8,
               right: 8,
               child: IconButton(
-                icon: const Icon(Icons.close, color: Colors.white),
+                icon: Icon(Icons.close, color: t.textColor),
                 onPressed: _dismiss,
               ),
             ),

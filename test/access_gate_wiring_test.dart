@@ -50,6 +50,22 @@ void main() {
       );
     });
 
+    test('#619 a dead gate-store link keeps the session', () {
+      // The access-gate store outlived its link and handed back
+      // `token_expired`. Not the user leaving: restart on the same session.
+      const gateStore =
+          'https://st.onelo.tools/store/hosted?token=srt_x&exit=signout';
+      expect(signOutBeforeRestart('token_expired', gateStore), isFalse);
+      expect(signOutBeforeRestart('expired_token', gateStore), isFalse);
+      // The ✕ / "Use a different account" still sign out.
+      expect(signOutBeforeRestart('invalid_token', gateStore), isTrue);
+      expect(
+        signOutBeforeRestart(
+            'invalid_token', 'https://st.onelo.tools/store/hosted?token=srt_x'),
+        isFalse,
+      );
+    });
+
     test('an ordinary store is left alone', () {
       // Opened by an entitled user from inside a working app. Signing them out
       // for declining to buy would be hostile.

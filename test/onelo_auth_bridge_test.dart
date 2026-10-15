@@ -139,6 +139,50 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUpAll(() => registerFallbackValue(FakeUri()));
 
+  test('restore-aware startup: a returning user is never resolved anonymously first (#738)', () async {
+    final mock = MockHttpClient();
+    final resolveBodies = <Map<String, dynamic>>[];
+    when(() => mock.get(any(), headers: any(named: 'headers'))).thenAnswer((_) async =>
+        http.Response('{"hosted_url":"https://example.com/auth","app_name":"App","allow_custom_branding":false}', 200));
+    when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+        .thenAnswer((inv) async {
+      final url = inv.positionalArguments[0].toString();
+      if (url.contains('/features/resolve')) {
+        resolveBodies.add(jsonDecode(inv.namedArguments[const Symbol('body')] as String) as Map<String, dynamic>);
+        return http.Response('{"features":{}}', 200);
+      }
+      return http.Response('{}', 200);
+    });
+    final storage = FakeSecureStorage();
+    await storage.write(key: 'onelo_access_token', value: 'tok_access');
+    await storage.write(key: 'onelo_refresh_token', value: 'tok_refresh');
+    await storage.write(
+        key: 'onelo_expires_at', value: DateTime.now().add(const Duration(hours: 1)).toIso8601String());
+    await storage.write(
+        key: 'onelo_user_json',
+        value: jsonEncode({'id': 'returning-user', 'email': 'u@e.com', 'role': 'member', 'tenant_id': null}));
+    final auth = OneloAuth(
+      config: const OneloConfig(publishableKey: 'pk_test', apiUrl: 'https://example.com', callbackScheme: 'myapp'),
+      storage: storage,
+      httpClient: mock,
+    );
+    final onelo = Onelo.withAuth(
+      publishableKey: 'pk_test',
+      apiUrl: 'https://example.com',
+      callbackScheme: 'myapp',
+      auth: auth,
+      httpClient: mock,
+    );
+    await auth.sessionRestored;
+    await Future.delayed(const Duration(milliseconds: 100));
+    expect(resolveBodies, isNotEmpty);
+    expect(resolveBodies.where((b) => b['userId'] == null), isEmpty,
+        reason: 'no anonymous resolve before the restored user');
+    expect(resolveBodies.first['userId'], 'returning-user');
+    expect(onelo.features.isReady, isTrue);
+    auth.eventStream.stop();
+  });
+
   test('features.load is called with userId when auth session is established', () async {
     final mock = MockHttpClient();
     final List<String> postBodies = [];

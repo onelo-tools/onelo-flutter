@@ -2,7 +2,7 @@ library onelo;
 
 import 'dart:async';
 import 'package:app_links/app_links.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'src/attest.dart';
@@ -17,17 +17,22 @@ import 'src/forms.dart';
 import 'src/waitlist.dart';
 import 'src/feedback.dart';
 import 'src/customer_portal.dart';
+import 'src/customer_portal_view.dart';
 import 'src/store.dart';
 import 'src/consent.dart';
+import 'src/hand_back.dart';
+import 'src/plan_change.dart';
 
 export 'src/types.dart';
-export 'src/auth.dart';
+export 'src/brand_tokens.dart' show OneloBrandTokens, OneloBrandedErrorView;
+export 'src/auth.dart' hide refreshRefusalIsBan;
 export 'src/auth_view.dart';
 export 'src/features.dart';
-export 'src/monitor.dart';
+export 'src/monitor.dart' hide errorOriginOf;
 export 'src/paywall.dart';
 export 'src/forms.dart';
 export 'src/waitlist.dart';
+export 'src/marketing_consent.dart';
 export 'src/feedback.dart';
 export 'src/customer_portal.dart';
 export 'src/customer_portal_view.dart';
@@ -46,6 +51,7 @@ class Onelo {
   late final OneloFeedback feedback;
   late final OneloCustomerPortal customerPortal;
   late final OneloStore store;
+  late final PlanChangeRefresher _planChange;
   late final OneloConsent consent;
   late final OneloAttest attest;
   late final VoidCallback _authListener;
@@ -62,6 +68,8 @@ class Onelo {
   // reload only on an actual user change, and lightly re-resolve on a same-user
   // entitlement change — not on every auth notification.
   String? _lastFeaturesUserId;
+  bool _featuresBound = false;
+  bool _disposedFeatures = false;
   OneloEntitlement? _lastFeaturesEntitlement;
 
   Onelo({
@@ -185,6 +193,9 @@ class Onelo {
           attest.assertionHeaders(method: m, path: path, query: q, body: b),
       maybeSelfHeal: attest.maybeSelfHealFromError,
       httpClient: httpClient,
+      // The signed-in user's access token proves the user on every Features
+      // call (#519); the shared stream already has it from auth.
+      userToken: auth.userToken,
     );
     monitor = OneloMonitor(
       publishableKey: publishableKey,
@@ -213,6 +224,20 @@ class Onelo {
       defaultStatus: featureDefaultStatus,
       autoLifecycleRefresh: autoLifecycleRefresh,
     );
+    // #659: a purchase / plan switch handed back by any hosted view or deep
+    // link reconciles features + entitlement at once, instead of waiting for
+    // the stream. One refresher, so the containers cannot drift.
+    _planChange = PlanChangeRefresher(
+      refreshFeatures: () => features.refresh(force: true),
+      revalidateEntitlement: () async {
+        await auth.revalidateEntitlement();
+      },
+      snapshot: features.snapshotKey,
+    );
+    auth.onPlanChange = (change) {
+      // ignore: discarded_futures
+      _planChange.handBack(change);
+    };
     paywall = OneloPaywall.withClient(client);
     forms = OneloForms(client);
     waitlist = OneloWaitlist(client);
@@ -227,6 +252,10 @@ class Onelo {
       getBundleId: auth.bundleId,
       getAttestToken: attest.headerToken,
       getIntegrityToken: attest.integrityHeaderToken,
+      onClosed: () async {
+        await auth.revalidateEntitlement();
+      },
+      onPlanChange: auth.reportPlanChange,
       httpClient: httpClient,
     );
     store = OneloStore(
@@ -235,6 +264,7 @@ class Onelo {
       callbackScheme: auth.callbackScheme,
       getAccessToken: () async => auth.currentSession?.accessToken,
       exchangeCode: auth.exchangeCode,
+      onPlanChange: auth.reportPlanChange,
       getInstanceId: auth.instanceId,
       getBundleId: auth.bundleId,
       getAttestToken: attest.headerToken,
@@ -263,14 +293,20 @@ class Onelo {
     _lastFeaturesUserId = null;
     _lastFeaturesEntitlement = null;
     _authListener = () {
+      // #738: no identity until the stored session is restored — otherwise an
+      // anonymous snapshot would be resolved (and marked ready) for a returning
+      // signed-in user before their own.
+      if (!auth.isSessionRestored) return;
       final session = auth.currentSession;
       final userId = session?.user.id;
       final entitlement = session?.user.entitlement;
       // Tag monitor events with the signed-in user (parity with Swift). Cheap,
       // so always keep it current.
       monitor.setUserId(userId);
-      if (userId != _lastFeaturesUserId) {
-        // User changed (login / logout / switch) → full reload.
+      if (!_featuresBound || userId != _lastFeaturesUserId) {
+        // First identity after restore, or user changed (login / logout /
+        // switch) → full reload.
+        _featuresBound = true;
         _lastFeaturesUserId = userId;
         _lastFeaturesEntitlement = entitlement;
         features.load(userId);
@@ -293,8 +329,15 @@ class Onelo {
     _checkoutToPortalSub =
         store.onCheckoutReturn.listen((_) => customerPortal.notifyCheckoutCompleted());
 
+    // ignore: discarded_futures
     auth.initialize();
-    features.load(null); // kickstart the anonymous resolve immediately
+    // Restore-aware startup (#738): bind Features to the restored identity (the
+    // stored user, or anonymous) as soon as the session restore finishes — not
+    // to anonymous first. Deduplicated with the listener via _featuresBound.
+    // ignore: discarded_futures
+    auth.sessionRestored.then((_) {
+      if (!_disposedFeatures) _authListener();
+    });
     _startDeepLinkListener();
   }
 
@@ -309,8 +352,8 @@ class Onelo {
       final appLinks = AppLinks();
       _linkSub = appLinks.uriLinkStream.listen((uri) {
         if (uri.scheme.toLowerCase() != scheme || uri.host != 'callback') return;
-        final source = uri.queryParameters['source'];
-        final code = uri.queryParameters['code'];
+        // The one Store Hand-back decoder (#615).
+        final hb = classifyHandBack(uri, scheme);
         // An Access Gate REFUSAL, checked before anything else: it carries no
         // code, so every branch below would ignore it and the link would die
         // here in silence. The app then waits on "Check your inbox" forever
@@ -325,14 +368,18 @@ class Onelo {
           });
           return;
         }
-        if (source == 'portal') {
+        if (hb?.kind == HandBackKind.portalClosed) {
           // ignore: discarded_futures
           customerPortal.completeExternalReturn(uri).catchError((Object e) {
             debugPrint('[Onelo] portal deep-link return failed: $e');
           });
-        } else if (code != null && code.isNotEmpty) {
+        } else if (hb?.kind == HandBackKind.switched) {
+          // A store switch finished in the system browser: nothing to
+          // exchange, but the plan moved (#659).
+          auth.reportPlanChange(PlanChange.switched(hb!.reason ?? ''));
+        } else if (hb?.kind == HandBackKind.purchase) {
           // ignore: discarded_futures
-          store.completeExternalCheckout(code).catchError((Object e) {
+          store.completeExternalCheckout(hb!.code!).catchError((Object e) {
             debugPrint('[Onelo] store checkout exchange failed: $e');
           });
         }
@@ -342,11 +389,20 @@ class Onelo {
     }
   }
 
-  /// Only needed when NOT using Onelo Auth (own auth system). Pass [userIdHash]
-  /// (`HMAC-SHA256(secret_key, "user:" + userId)`, computed on YOUR backend) to
-  /// use Secure Mode so per-user targeting can't be spoofed with a raw userId.
+  /// Deprecated: the signed-in Onelo user is used automatically. Onelo Auth is
+  /// mandatory (#511), and every Features call proves that user with their
+  /// access token, so there is nothing to identify. [userIdHash] is ignored
+  /// (Secure Mode is retired). Kept so existing code compiles.
+  ///
+  /// Without an Onelo session the id is still sent unverified until the server
+  /// stops trusting it (#521); with one, the token decides the user.
+  @Deprecated('The signed-in Onelo user is used automatically; Features calls '
+      'prove them with their access token. userIdHash is ignored.')
   Future<void> identify(String userId, {String? userIdHash}) async {
-    await features.load(userId, userIdHash: userIdHash);
+    // The app named its own identity: the post-restore bind must not replace
+    // it with anonymous (the listener still follows real Onelo Auth changes).
+    _featuresBound = true;
+    await features.load(userId);
   }
 
   /// Opens the upgrade flow for [plan] in the SYSTEM BROWSER and returns.
@@ -371,11 +427,16 @@ class Onelo {
   /// ```
   ///
   /// Requires a signed-in session (no-op + debug warning otherwise; the upgrade
-  /// page needs to know who is upgrading). Fire-and-forget — the return
-  /// `<scheme>://callback` deep link is handled by the existing app_links
-  /// listener, so a completed change refreshes entitlement/features automatically.
+  /// page needs to know who is upgrading).
+  ///
+  /// Pass [context] to open it in the SDK's own [OneloCustomerPortalView]
+  /// (#606, pushed on the nearest Navigator): the store's hand-back (purchase,
+  /// plan switch, "Return to app" on a spent link) closes it, the entitlement is
+  /// re-read, and the call completes when it closes. Without [context] the URL
+  /// opens in the system browser, and only the app_links listener can see how
+  /// it ended.
   /// 1:1 with Swift `Onelo.openUpgrade(forPlan:)` + Android `openUpgrade(plan:)`.
-  Future<void> openUpgrade(String plan, {String lang = 'en'}) async {
+  Future<void> openUpgrade(String plan, {String lang = 'en', BuildContext? context}) async {
     var session = auth.currentSession;
     if (session != null && DateTime.now().isAfter(session.expiresAt)) {
       session = await auth.refreshSession();
@@ -386,6 +447,18 @@ class Onelo {
     }
     try {
       final url = await store.initiateUpgradeFlow(plan: plan, lang: lang);
+      if (context != null && context.mounted) {
+        final navigator = Navigator.of(context);
+        await navigator.push<void>(MaterialPageRoute(
+          fullscreenDialog: true,
+          builder: (routeContext) => OneloCustomerPortalView(
+            portal: customerPortal,
+            url: url,
+            onDismiss: () => Navigator.of(routeContext).pop(),
+          ),
+        ));
+        return;
+      }
       await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
     } catch (e) {
       debugPrint('[Onelo] openUpgrade failed: $e');
@@ -395,11 +468,13 @@ class Onelo {
   /// Release resources. Call when the SDK is no longer needed.
   Future<void> dispose() async {
     auth.removeListener(_authListener);
+    _planChange.cancel();
     await _linkSub?.cancel();
     await _checkoutToPortalSub?.cancel();
     store.dispose();
     customerPortal.dispose();
     consent.dispose();
+    _disposedFeatures = true;
     features.dispose();
     // Stop the shared realtime stream — features now opens it at startup (even
     // anonymously), so without this the SSE connection would outlive dispose().

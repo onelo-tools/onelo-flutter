@@ -4,6 +4,7 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'customer_portal.dart';
 import 'webview_bridge.dart';
+import 'brand_tokens.dart';
 
 /// Full-screen widget that renders the Onelo hosted Customer Portal IN AN IN-APP
 /// WEBVIEW and hands ONLY the Stripe CARD page (from a portal "Change plan") off to
@@ -33,10 +34,21 @@ class OneloCustomerPortalView extends StatefulWidget {
   /// external card returned). The widget does NOT pop itself.
   final VoidCallback onDismiss;
 
+  /// `OneloPortalIntent.changePlan` opens the portal straight into the plan
+  /// picker (#606). `null` opens the management home.
+  final OneloPortalIntent? intent;
+
+  /// An already-minted hosted URL to load instead of a fresh portal — the
+  /// store, plan switch or portal that [Onelo.openUpgrade] resolved (#606).
+  /// Renewal still mints a portal.
+  final String? url;
+
   const OneloCustomerPortalView({
     super.key,
     required this.portal,
     required this.onDismiss,
+    this.intent,
+    this.url,
   });
 
   @override
@@ -75,6 +87,9 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
   void _dismiss() {
     if (_dismissed || !mounted) return;
     _dismissed = true;
+    // #606 — re-read the entitlement so the app sees a plan bought or changed
+    // here. Fire-and-forget: the host pops the route right away.
+    unawaited(widget.portal.notifyClosed());
     widget.onDismiss();
   }
 
@@ -95,7 +110,8 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
 
   Future<void> _loadPortal() async {
     try {
-      final url = await widget.portal.initiateCustomerPortal();
+      final url = widget.url ??
+          await widget.portal.initiateCustomerPortal(intent: widget.intent);
       if (!mounted) return;
       setState(() {
         _portalUrl = url;
@@ -181,8 +197,17 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
 
   @override
   Widget build(BuildContext context) {
+    // #681 — every piece of chrome from the brand tokens; rebuilt when an
+    // initiate response refreshes them.
+    return ValueListenableBuilder<OneloBrandTokens>(
+      valueListenable: OneloBrand.notifier,
+      builder: (context, t, _) => _buildChrome(t),
+    );
+  }
+
+  Widget _buildChrome(OneloBrandTokens t) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: t.pageBgColor,
       body: SafeArea(
         child: Stack(
           children: [
@@ -194,10 +219,19 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
                 // browser (immune to flutter_inappwebview's null-URL onCreateWindow bug).
                 // withReadyRelay: forward the hosted portal's `onelo:ready`
                 // postMessage → the oneloReady handler → hide the native ✕.
-                initialUserScripts: oneloBridgeUserScripts(withReadyRelay: true),
+                // withRenewRelay: the page asks for a fresh portal when its
+                // token dies (#613 / #614); the SDK answers with one.
+                initialUserScripts: oneloBridgeUserScripts(withReadyRelay: true, withRenewRelay: true),
                 onWebViewCreated: (controller) {
                   registerOneloExternalOpenHandler(controller);
                   registerOneloReadyHandler(controller, _onHostedReady);
+                  registerOneloRenewHandler(controller, (requestId) async {
+                    // Only a page still on the portal's origin may receive a
+                    // fresh portal (a bearer credential).
+                    final current = await controller.getUrl();
+                    if (!oneloSameOrigin(current?.uriValue, _portalUrl)) return null;
+                    return widget.portal.renewReply(requestId);
+                  });
                 },
                 initialSettings: InAppWebViewSettings(
                   transparentBackground: true,
@@ -216,28 +250,14 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
               ),
 
             if (_portalUrl == null && _errorMessage == null)
-              const Center(child: CircularProgressIndicator(color: Colors.white)),
+              Center(child: CircularProgressIndicator(color: t.brandColor, backgroundColor: t.spinnerTrackColor)),
 
             if (_errorMessage != null)
-              Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        _errorMessage!,
-                        style: const TextStyle(color: Colors.white),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 16),
-                      TextButton(
-                        onPressed: _dismiss,
-                        child: const Text('Close', style: TextStyle(color: Colors.white)),
-                      ),
-                    ],
-                  ),
-                ),
+              OneloBrandedErrorView(
+                tokens: t,
+                message: _errorMessage!,
+                buttonLabel: 'Close',
+                onPressed: _dismiss,
               ),
 
             // #40 Phase 2 + #44 — the native ✕ is a FAIL-SAFE only. The canonical
@@ -251,7 +271,7 @@ class _OneloCustomerPortalViewState extends State<OneloCustomerPortalView> {
                 top: 8,
                 right: 8,
                 child: IconButton(
-                  icon: const Icon(Icons.close, color: Colors.white),
+                  icon: Icon(Icons.close, color: t.textColor),
                   onPressed: _dismiss,
                 ),
               ),

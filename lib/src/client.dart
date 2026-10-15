@@ -1,7 +1,10 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'http_client.dart';
+import 'marketing_consent.dart';
 import 'types.dart';
+import 'user_token.dart';
 import 'version.dart';
 
 class OneloClient {
@@ -52,6 +55,12 @@ class OneloClient {
 
   final http.Client _httpClient;
 
+  /// The signed-in Onelo user's access token, sent as `Authorization: Bearer`
+  /// on every Features call so the server knows who the user really is (#519).
+  /// Wired by `Onelo` to `OneloAuth.userToken`; null sends no token.
+  final OneloUserToken? userToken;
+  bool _userTokenRefusedWarned = false;
+
   OneloClient({
     required this.publishableKey,
     required this.apiUrl,
@@ -64,6 +73,7 @@ class OneloClient {
     Future<Map<String, String>?> Function(String, String, String, String)? getAssertionHeaders,
     void Function(dynamic)? maybeSelfHeal,
     http.Client? httpClient,
+    this.userToken,
   })  : _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
@@ -76,7 +86,9 @@ class OneloClient {
     // SDK-version telemetry on every client-based call (features, paywall, forms,
     // waitlist, feedback) so the dashboard can flag outdated SDKs. Was previously
     // only sent by auth/event_stream — version.dart's "every request" now holds.
-    'X-Sdk-Version': oneloFlutterSdkVersion,
+    // ...and the SDK's NAME with it (#122), so the dashboard knows which
+    // registry row that version belongs to.
+    ...oneloSdkIdentityHeaders,
     if (bundleId != null && bundleId!.isNotEmpty) 'X-Bundle-Id': bundleId!,
   };
 
@@ -128,48 +140,116 @@ class OneloClient {
     return h;
   }
 
-  Future<FeatureResolveResult> resolveFeatures({String? userId, String? userIdHash}) async {
-    final body = <String, dynamic>{'publishableKey': publishableKey};
-    if (userId != null) body['userId'] = userId;
-    if (userIdHash != null) body['userIdHash'] = userIdHash;
-    if (featureEnvironment != null) body['environment'] = featureEnvironment;
-    final response = await _post('/api/sdk/features/resolve', body);
-    final featuresMap = response['features'] as Map<String, dynamic>? ?? {};
+  /// The server refused the signed-in user's access token even after a
+  /// refresh, so the call went out anonymous. Features has no error callback;
+  /// this one-time log is its error channel (like the anonymous-mode warning).
+  void _warnUserTokenRefused() {
+    if (_userTokenRefusedWarned) return;
+    _userTokenRefusedWarned = true;
+    debugPrint(
+      "[Onelo] The signed-in user's access token was refused by Features (invalid_user_token) "
+      'even after a refresh, so the request was made without a user. '
+      'Check that the publishableKey belongs to the app the user signed in to.',
+    );
+  }
+
+  /// `GET /api/sdk/feedback/initiate` (#820). Signed in, it carries
+  /// `Authorization: Bearer <access token>`, so the server signs the token's
+  /// user as a VERIFIED reporter. A refused token is refreshed and retried
+  /// once; refused again, the call goes out without it (as a signed-out one
+  /// would), so feedback never fails on identity. [userId] travels as a
+  /// header (`X-Onelo-User-Id`), never a query param, so it stays out of the
+  /// access log; without a session it is the developer's unverified label.
+  /// The async security headers ride along — the backend security gate 403s
+  /// a live app on /feedback/initiate without `X-Bundle-Id`.
+  Future<http.Response> feedbackInitiate(Map<String, String> params, {String? userId}) async {
+    final uri = Uri.parse('$apiUrl/api/sdk/feedback/initiate').replace(queryParameters: params);
+    final security = await securityHeaders();
+    return sendWithUserToken(userToken, (attempt) {
+      return _httpClient.get(uri, headers: {
+        ...security,
+        if (userId != null) 'X-Onelo-User-Id': userId,
+        ...bearerHeaders(attempt.token),
+      });
+    }, onRefused: () {});
+  }
+
+  /// Resolve the feature snapshot. `userId` rides along with the Bearer: the
+  /// server ignores it when the token is valid, and a server without #517
+  /// still resolves by it. [userIdHash] is ignored (Secure Mode is retired).
+  /// [anonymousFallback] false: a refused token is not retried anonymously (the
+  /// call then throws) — Features passes false for a signed-in identity.
+  Future<FeatureResolveResult> resolveFeatures({
+    String? userId,
+    String? userIdHash,
+    bool anonymousFallback = true,
+  }) async {
+    final response = await sendWithUserToken(userToken, (attempt) {
+      final body = <String, dynamic>{'publishableKey': publishableKey};
+      if (userId != null && !attempt.anonymous) body['userId'] = userId;
+      if (featureEnvironment != null) body['environment'] = featureEnvironment;
+      return _postRaw('/api/sdk/features/resolve', body, bearerHeaders(attempt.token));
+    }, onRefused: _warnUserTokenRefused, anonymousFallback: anonymousFallback);
+    _throwUnlessSuccess(response);
+    final data = response.body.isEmpty
+        ? <String, dynamic>{}
+        : jsonDecode(response.body) as Map<String, dynamic>;
+    final featuresMap = data['features'] as Map<String, dynamic>? ?? {};
     final features = featuresMap.map(
       (key, value) => MapEntry(key, ResolvedFeature.fromWire(value as Map<String, dynamic>)),
     );
     return FeatureResolveResult(
       features: features,
-      anonymous: (response['anonymous'] as bool?) ?? false,
-      targetingMisses: (response['targeting_misses'] as int?) ?? 0,
+      anonymous: (data['anonymous'] as bool?) ?? false,
+      targetingMisses: (data['targeting_misses'] as int?) ?? 0,
     );
   }
 
+  /// Discovery ping. [userIdHash] is ignored (Secure Mode is retired).
   Future<void> batchPing(List<String> features, {String? userId, String? userIdHash}) async {
     if (features.isEmpty) return;
-    final body = <String, dynamic>{
-      'publishableKey': publishableKey,
-      'features': features,
-    };
-    if (userId != null) body['userId'] = userId;
-    if (userIdHash != null) body['userIdHash'] = userIdHash;
-    if (featureEnvironment != null) body['environment'] = featureEnvironment;
-    await _post('/api/sdk/features/batch-ping', body);
+    // batch-ping answers a throttled 204 BEFORE it looks at the token, so its
+    // 2xx proves nothing about the token and must not end a refusal episode.
+    final response = await sendWithUserToken(userToken, (attempt) {
+      final body = <String, dynamic>{
+        'publishableKey': publishableKey,
+        'features': features,
+      };
+      if (userId != null && !attempt.anonymous) body['userId'] = userId;
+      if (featureEnvironment != null) body['environment'] = featureEnvironment;
+      return _postRaw('/api/sdk/features/batch-ping', body, bearerHeaders(attempt.token));
+    }, onRefused: _warnUserTokenRefused, provesAcceptance: false);
+    _throwUnlessSuccess(response);
   }
 
   Future<Map<String, dynamic>> pollFeatures({
     required int configVersion,
     String? userId,
     String? userIdHash,
+    bool anonymousFallback = true,
   }) async {
     // Backend /poll reads the cursor from `since_version` (not `version`); a
     // wrong name makes the up_to_date short-circuit dead → full resolve each poll.
-    final params = {'key': publishableKey, 'since_version': configVersion.toString()};
-    if (userId != null) params['userId'] = userId;
-    if (userIdHash != null) params['userIdHash'] = userIdHash;
-    if (featureEnvironment != null) params['environment'] = featureEnvironment!;
-    final uri = Uri.parse('$apiUrl/api/sdk/features/poll').replace(queryParameters: params);
-    final response = await _httpClient.get(uri, headers: await _headers());
+    // The key is NOT in the query string — it travels as the
+    // `X-Publishable-Key` request header (ADR-0003, #105), exactly as
+    // event_stream.dart sends it on the stream. /poll fires on a timer, so a
+    // raw key in the URL landed in the reverse proxy's access.log on every
+    // tick; from 2027-03-31 the backend refuses `?key=` outright.
+    // [userIdHash] is ignored (Secure Mode is retired).
+    final response = await sendWithUserToken(userToken, (attempt) async {
+      final params = {'since_version': configVersion.toString()};
+      if (userId != null && !attempt.anonymous) params['userId'] = userId;
+      if (featureEnvironment != null) params['environment'] = featureEnvironment!;
+      final uri = Uri.parse('$apiUrl/api/sdk/features/poll').replace(queryParameters: params);
+      return _httpClient.get(
+        uri,
+        headers: {
+          ...await _headers(),
+          'X-Publishable-Key': publishableKey,
+          ...bearerHeaders(attempt.token),
+        },
+      );
+    }, onRefused: _warnUserTokenRefused, anonymousFallback: anonymousFallback);
     if (response.statusCode != 200) {
       // Feature polling is a long-lived, indefinitely-repeating loop — without
       // this, a stale cached attest/integrity credential would keep 403ing on
@@ -202,11 +282,14 @@ class OneloClient {
     );
   }
 
-  Future<WaitlistResult> joinWaitlist(String slug, String email) async {
+  Future<WaitlistResult> joinWaitlist(String slug, String email, {OneloWaitlistConsent? consent}) async {
+    final wire = consent?.wireValue;
     final response = await _post('/api/sdk/waitlist/join', {
       'publishableKey': publishableKey,
       'slug': slug,
       'email': email,
+      // #818: the checkboxes the form showed.
+      if (wire != null) 'consent': wire,
     });
     // Backend returns {"ok": true, "position": N} on a fresh join and
     // {"ok": true, "alreadyJoined": true, "position": pos} on a duplicate.
@@ -222,21 +305,28 @@ class OneloClient {
 
   /// Mint a short-lived, feature-scoped module token (`POST
   /// /api/sdk/features/module-token`) for CDN-gated module downloads. Returns
-  /// the JWT string. Throws [OneloFeaturesException] on 401 (auth / Secure
-  /// Mode), 403 (not entitled) or a network error. Mirrors Swift `moduleToken`.
+  /// the JWT string. Throws [OneloFeaturesException] on 401 (not signed in, or
+  /// the access token refused even after a refresh), 403 (not entitled) or a
+  /// network error. Mirrors Swift `moduleToken`. [userIdHash] is ignored.
   Future<String> moduleToken(String slug, {required String userId, String? userIdHash}) async {
     final body = <String, dynamic>{
       'publishableKey': publishableKey,
       'userId': userId,
       'slug': slug,
     };
-    if (userIdHash != null) body['userIdHash'] = userIdHash;
     http.Response response;
     try {
-      response = await _httpClient.post(
-        Uri.parse('$apiUrl/api/sdk/features/module-token'),
-        headers: await _headers(json: true),
-        body: jsonEncode(body),
+      // A module token is always for a user, so a refused token ends here
+      // (notAuthenticated) instead of retrying anonymously.
+      response = await sendWithUserToken(
+        userToken,
+        (attempt) async => _httpClient.post(
+          Uri.parse('$apiUrl/api/sdk/features/module-token'),
+          headers: {...await _headers(json: true), ...bearerHeaders(attempt.token)},
+          body: jsonEncode(body),
+        ),
+        onRefused: _warnUserTokenRefused,
+        anonymousFallback: false,
       );
     } catch (e) {
       throw OneloFeaturesException(
@@ -252,19 +342,10 @@ class OneloClient {
       return token;
     }
     if (response.statusCode == 401) {
-      // Backend detail shape: {"detail": {"error": "<code>"}} (FastAPI-wrapped).
-      switch (_errorCode(response.body)) {
-        case 'secure_mode_required':
-          throw const OneloFeaturesException(
-            OneloFeaturesErrorKind.secureModeRequired,
-            'Secure Mode is on — pass userIdHash to identify()');
-        case 'invalid_user_hash':
-          throw const OneloFeaturesException(
-            OneloFeaturesErrorKind.invalidUserHash, 'userIdHash failed verification');
-        default:
-          throw const OneloFeaturesException(
-            OneloFeaturesErrorKind.notAuthenticated, 'Not authenticated');
-      }
+      // Any 401 — including a user token refused even after a refresh — means
+      // the user is not proven (Secure Mode's codes are retired, #519).
+      throw const OneloFeaturesException(
+        OneloFeaturesErrorKind.notAuthenticated, 'Not authenticated');
     }
     if (response.statusCode == 403) {
       throw const OneloFeaturesException(
@@ -274,22 +355,25 @@ class OneloClient {
       OneloFeaturesErrorKind.networkError, 'module-token failed (${response.statusCode})');
   }
 
-  /// Pull the `detail.error` code out of a FastAPI error body, or null.
-  String? _errorCode(String body) {
-    try {
-      final data = jsonDecode(body);
-      if (data is Map && data['detail'] is Map) {
-        return (data['detail'] as Map)['error'] as String?;
-      }
-    } catch (_) {}
-    return null;
-  }
-
   /// Public wrapper for use by other SDK classes (e.g. OneloPaywall).
   Future<Map<String, dynamic>> post(String path, Map<String, dynamic> body) =>
       _post(path, body);
 
   Future<Map<String, dynamic>> _post(String path, Map<String, dynamic> body) async {
+    final response = await _postRaw(path, body);
+    _throwUnlessSuccess(response);
+    // 204 No Content (e.g. batch-ping) has an empty body — return an empty map.
+    if (response.body.isEmpty) return <String, dynamic>{};
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  /// One POST with the security headers (+ [extraHeaders], e.g. the Features
+  /// Bearer), answered as-is. A non-2xx body is offered to self-heal.
+  Future<http.Response> _postRaw(
+    String path,
+    Map<String, dynamic> body, [
+    Map<String, String> extraHeaders = const {},
+  ]) async {
     // FAZA 3 — bodyStr is hashed for the assertion AND sent as the request body,
     // so client and server hash byte-identical bytes. batch-ping is skipped: it's
     // the fleet-scale verify-only telemetry path (server replay_guard=NO), so a
@@ -300,21 +384,23 @@ class OneloClient {
       final ah = await _getAssertionHeaders?.call('POST', path, '', bodyStr);
       if (ah != null) headers.addAll(ah);
     }
+    headers.addAll(extraHeaders);
     final response = await _httpClient.post(
       Uri.parse('$apiUrl$path'),
       headers: headers,
       body: bodyStr,
     );
+    if ((response.statusCode < 200 || response.statusCode >= 300) && response.body.isNotEmpty) {
+      try {
+        _maybeSelfHeal?.call(jsonDecode(response.body));
+      } catch (_) {}
+    }
+    return response;
+  }
+
+  void _throwUnlessSuccess(http.Response response) {
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      if (response.body.isNotEmpty) {
-        try {
-          _maybeSelfHeal?.call(jsonDecode(response.body));
-        } catch (_) {}
-      }
       throw Exception('Onelo API error ${response.statusCode}: ${response.body}');
     }
-    // 204 No Content (e.g. batch-ping) has an empty body — return an empty map.
-    if (response.body.isEmpty) return <String, dynamic>{};
-    return jsonDecode(response.body) as Map<String, dynamic>;
   }
 }

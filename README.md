@@ -69,7 +69,7 @@ Everything below hangs off the one `onelo` instance.
 
 | Accessor | What it does | Key methods |
 |---|---|---|
-| `onelo.auth` | Hosted sign-in and sessions | `signIn()`, `signInWithOAuth()`, `getSession()`, `signOut()`, `currentSession`, `isAllowedIn` |
+| `onelo.auth` | Hosted sign-in and sessions | `signIn()`, `signUp()`, `signInWithOAuth()`, `getSession()`, `signOut()`, `currentSession`, `isAllowedIn`, `signupMarketingConsent` |
 | `onelo.features` | Plan-gated feature flags | `declare()`, `feature()`, `isEnabled()`, `ready()`, `refresh()` |
 | `onelo.monitor` | Error and event reporting | `capture()`, `track()`, `event()`, `breadcrumb()`, `setUserId()` |
 | `onelo.store` | Your hosted store, on your own Stripe | `initiateStoreFlow()`, `initiateUpgradeFlow()`, `onCheckoutReturn` |
@@ -82,6 +82,15 @@ Everything below hangs off the one `onelo` instance.
 | `onelo.attest` | Device attestation (automatic — see below) | `attestIfNeeded()` |
 
 Ready-made widgets: `OneloAuthView`, `OneloStoreView`, `OneloCustomerPortalView`, `OneloConsentGate`.
+
+### Show gated UI only once features are ready
+
+`onelo.features.ready()` returns once the server has confirmed the feature snapshot for the **current** user: the restored session at launch, and the new user after each sign-in or user switch (it resets on every identity change). Await it once before showing gated UI, at launch and again after each sign-in. It is bounded by a timeout (1500 ms by default); after that `feature()` serves the user's saved snapshot and `onelo.features` notifies listeners when the confirmed one arrives.
+
+```dart
+await onelo.features.ready();
+runApp(const MyApp()); // gated UI goes up only now
+```
 
 ### Feature status
 
@@ -96,6 +105,8 @@ if (f.isEnabled)   showExportButton();
 if (f.isUpsell)    showUpgradePrompt();
 if (f.isComingSoon) showComingSoonBadge();
 ```
+
+Feature flags follow the signed-in Onelo user automatically: every Features call sends that user's access token, so the server knows who is asking. There is nothing to identify. `identify()` and its `userIdHash` argument still compile but are deprecated, and `userIdHash` is no longer sent.
 
 ## Device attestation
 

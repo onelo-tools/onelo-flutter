@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'http_client.dart';
 import 'version.dart';
+import 'plan_change.dart';
+import 'brand_tokens.dart';
 
 /// Onelo hosted Store (plans / checkout) flow.
 ///
@@ -41,6 +43,13 @@ class OneloStore {
   /// from [Onelo] to `OneloAuth.exchangeCode` → POST /api/sdk/auth/hosted-callback).
   final Future<void> Function(String code) _exchangeCode;
 
+  /// Wired from `Onelo` to `OneloAuth.reportPlanChange` (#659).
+  final void Function(PlanChange change)? _onPlanChange;
+
+  /// The store view finished a code-less plan switch: reconcile the plan at
+  /// once (#659) instead of waiting for the Event Stream.
+  void reportSwitch(String reason) => _onPlanChange?.call(PlanChange.switched(reason));
+
   /// Supplies the stable per-install id sent as `X-Onelo-Instance-Id` (matches
   /// the other modules so the backend sees one instance identity).
   final Future<String> Function()? _getInstanceId;
@@ -71,6 +80,7 @@ class OneloStore {
     required String callbackScheme,
     required Future<String?> Function() getAccessToken,
     required Future<void> Function(String code) exchangeCode,
+    void Function(PlanChange change)? onPlanChange,
     Future<String> Function()? getInstanceId,
     Future<String?> Function()? getBundleId,
     Future<String?> Function()? getAttestToken,
@@ -81,6 +91,7 @@ class OneloStore {
         _callbackScheme = callbackScheme,
         _getAccessToken = getAccessToken,
         _exchangeCode = exchangeCode,
+        _onPlanChange = onPlanChange,
         _getInstanceId = getInstanceId,
         _getBundleId = getBundleId,
         _getAttestToken = getAttestToken,
@@ -213,6 +224,7 @@ class OneloStore {
     } catch (_) {
       throw OneloStoreInitiateException('Invalid JSON from store-initiate');
     }
+    OneloBrand.adopt(data); // #681: store-initiate carries brand_tokens
 
     final storeUrl = data['store_url'] as String?;
     if (storeUrl == null || storeUrl.isEmpty) {
@@ -273,6 +285,7 @@ class OneloStore {
     } catch (_) {
       throw OneloStoreInitiateException('Invalid JSON from upgrade-initiate');
     }
+    OneloBrand.adopt(data); // #681: upgrade-initiate carries brand_tokens
 
     final upgradeUrl = data['upgrade_url'] as String?;
     if (upgradeUrl == null || upgradeUrl.isEmpty) {

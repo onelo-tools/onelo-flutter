@@ -29,7 +29,6 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
   Timer? _pollTimer;
   Timer? _pingDebounceTimer;
   String? _userId;
-  String? _userIdHash;
   final bool _suppressIdentifyWarning;
   bool _anonymousWarningLogged = false;
 
@@ -44,7 +43,10 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
   /// `Onelo(autoLifecycleRefresh:)`.
   final bool _autoLifecycleRefresh;
 
-  bool _isReady = false;
+  // #738: the epoch whose snapshot the server has CONFIRMED (-1 = none). Ready
+  // means confirmed for the CURRENT identity, so it resets on every identity change.
+  int _confirmedEpoch = -1;
+  bool _identityLoaded = false;
   Completer<void>? _readyCompleter;
   // Monotonic load token. Every load() bumps it; an in-flight resolve/disk-read
   // only applies its result while it still owns the latest epoch — so a slow
@@ -103,36 +105,55 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
   /// Apply a realtime `{config_version, features}` snapshot to the live cache,
   /// persist it, and notify. Uses the shared [ResolvedFeature.fromWire] decode so
   /// reason / requiredPlan ride along exactly like /resolve + poll.
+  ///
+  /// #738: applied only when the connection is bound to the identity Features
+  /// is loaded for — a connection that fell back to anonymous (or still serves
+  /// the previous user) never overwrites this identity's snapshot. A version-only
+  /// frame advances the cursor only for an already confirmed snapshot.
   void _applySseSnapshot(Map<String, dynamic> data) {
+    if (!_identityLoaded) return;
+    final uid = _userId;
+    if (_eventStream?.boundUserId != uid) return;
     final v = data['config_version'];
-    if (v is int) _configVersion = v;
     final features = data['features'];
     if (features is Map<String, dynamic>) {
+      if (v is int) _configVersion = v;
       _cache = features.map(
         (k, val) => MapEntry(k, ResolvedFeature.fromWire(val as Map<String, dynamic>)),
       );
       // ignore: discarded_futures
-      _writeDiskCache(_userId);
+      _writeDiskCache(uid);
+      _confirm(_loadEpoch);
       _safeNotify();
+    } else if (_isConfirmed && v is int) {
+      _configVersion = v;
     }
-    _signalReady();
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
-  /// True once the first resolve (or its disk-cache fallback) has completed.
-  bool get isReady => _isReady;
+  /// True once the server has confirmed the snapshot for the CURRENT identity
+  /// (the restored session at launch, the new user after sign-in or a switch).
+  /// Resets on every identity change; a failed resolve does not set it.
+  bool get isReady => _identityLoaded && _confirmedEpoch == _loadEpoch;
 
-  /// Awaits the first resolve (or [timeout]) so the UI can render without a
-  /// cold-start "everything hidden" flash. Never throws — returns after the
-  /// timeout even if the network is still pending.
+  bool get _isConfirmed => isReady;
+
+  /// Awaits the confirmed snapshot of the current identity (or [timeout]) so
+  /// gated UI renders complete. Follows identity changes while waiting. Never
+  /// throws — after the timeout [feature] serves the identity's persisted
+  /// snapshot and listeners are notified when the confirmed one lands.
   Future<void> ready({Duration timeout = const Duration(milliseconds: 1500)}) async {
-    if (_isReady) return;
-    final completer = _readyCompleter ??= Completer<void>();
-    try {
-      await completer.future.timeout(timeout);
-    } catch (_) {
-      // timed out — best-effort, matches Swift's ready(timeout:)
+    final deadline = DateTime.now().add(timeout);
+    while (!isReady) {
+      final left = deadline.difference(DateTime.now());
+      if (left <= Duration.zero) return;
+      final completer = _readyCompleter ??= Completer<void>();
+      try {
+        await completer.future.timeout(left);
+      } catch (_) {
+        return; // timed out — best-effort, matches Swift's ready(timeout:)
+      }
     }
   }
 
@@ -165,14 +186,26 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
     _configVersion = 0;
   }
 
+  /// A comparable picture of the current snapshot — the plan-change refresher
+  /// (#659) re-checks until it differs.
+  String snapshotKey() {
+    final names = _cache.keys.toList()..sort();
+    return names.map((n) {
+      final f = _cache[n]!;
+      return '$n|${f.status}|${f.reason}|${f.requiredPlan}|${f.upgradeCta}';
+    }).join('\n');
+  }
+
   /// Force a REST snapshot reconcile. Debounced to one call per second unless
   /// [force] is set (for user-initiated "Refresh" buttons / lifecycle resync).
   /// Never throws — the cached state stays valid on failure.
   Future<void> refresh({bool force = false}) async {
     final now = DateTime.now();
+    // No identity yet (startup still restoring the session): nothing to resolve.
+    if (!_identityLoaded) return;
     if (!force && now.difference(_lastRefreshAt) < _refreshDebounce) return;
     _lastRefreshAt = now;
-    await _resolve(_loadEpoch);
+    await _resolve(_loadEpoch, _userId);
   }
 
   /// Returns the names of all features whose status is enabled, new, or beta.
@@ -197,15 +230,27 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
         'moduleToken requires an identified user — sign in or call onelo.identify(userId)',
       );
     }
-    return _client.moduleToken(slug, userId: uid, userIdHash: _userIdHash);
+    return _client.moduleToken(slug, userId: uid);
   }
 
   // ── Internal ───────────────────────────────────────────────────────────────
 
+  /// Load features for [userId] (null = anonymous). [userIdHash] is ignored:
+  /// Secure Mode is retired, and the signed-in Onelo user is proven with their
+  /// access token automatically (#519).
   Future<void> load(String? userId, {String? userIdHash}) async {
     final epoch = ++_loadEpoch;
+    final changed = !_identityLoaded || userId != _userId;
+    _identityLoaded = true;
     _userId = userId;
-    _userIdHash = userIdHash;
+    if (changed) {
+      // #738: a new identity starts from ITS persisted snapshot or empty —
+      // never the previous identity's — and nothing is confirmed for it yet.
+      _cache = {};
+      _configVersion = 0;
+      _safeNotify();
+    }
+    _confirmedEpoch = -1;
     // Open (or re-target) the realtime stream for this identity so
     // `features_updated` starts flowing. Anonymous-capable, so features-only
     // apps get realtime too; a no-op when auth already started it for this user.
@@ -215,12 +260,16 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
     if (epoch != _loadEpoch) return; // superseded by a newer load
     if (_shouldBatchPingOnLoad()) await _batchPing();
     if (epoch != _loadEpoch) return;
-    await _resolve(epoch);
+    await _resolve(epoch, userId);
     if (epoch != _loadEpoch) return;
     _startPolling();
   }
 
   void stopPolling() => _stopPolling();
+
+  /// Test-only: run one poll tick now for the current identity.
+  @visibleForTesting
+  Future<void> pollNowForTesting() => _poll(_loadEpoch, _userId);
 
   // ── Private ────────────────────────────────────────────────────────────────
 
@@ -243,7 +292,7 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
     final names = _discovered.toList();
     if (names.isEmpty) return;
     try {
-      await _client.batchPing(names, userId: _userId, userIdHash: _userIdHash);
+      await _client.batchPing(names, userId: _userId);
     } catch (e) {
       // Not silent (feedback_no_silent_swallows) — a rejected ping usually means
       // this device isn't authorized for test-env discovery yet. 1:1 with Swift
@@ -252,26 +301,34 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _resolve(int epoch) async {
+  Future<void> _resolve(int epoch, String? userId) async {
     try {
-      final result = await _client.resolveFeatures(userId: _userId, userIdHash: _userIdHash);
+      // A signed-in identity never takes the anonymous fallback answer (#738):
+      // a refused token keeps this identity's snapshot instead.
+      final result = await _client.resolveFeatures(
+        userId: userId,
+        anonymousFallback: userId == null,
+      );
       if (epoch != _loadEpoch) return; // a newer load superseded this result
       _cache = result.features;
+      _configVersion = 0; // /resolve carries no version; the next poll is a full one
       _maybeWarnAnonymous(result);
-      _signalReady();
-      await _writeDiskCache(_userId);
+      _confirm(epoch);
+      await _writeDiskCache(userId);
       _safeNotify();
     } catch (_) {
-      // Keep the last cache; poll / next refresh catches up. Still signal ready
-      // so a caller awaiting ready() on an offline start isn't blocked forever.
-      if (epoch == _loadEpoch) _signalReady();
+      // Keep the last cache; poll / next refresh catches up. Not confirmed —
+      // ready() is bounded by its timeout instead.
     }
   }
 
-  void _signalReady() {
-    if (_isReady) return;
-    _isReady = true;
+  /// The server answered for [epoch]'s identity: mark it confirmed and release
+  /// ready() waiters (they re-check, so a superseded epoch keeps them waiting).
+  void _confirm(int epoch) {
+    if (epoch != _loadEpoch) return;
+    _confirmedEpoch = epoch;
     final c = _readyCompleter;
+    _readyCompleter = null;
     if (c != null && !c.isCompleted) c.complete();
   }
 
@@ -293,12 +350,14 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _poll(int epoch, String? userId, String? userIdHash) async {
+  Future<void> _poll(int epoch, String? userId) async {
     try {
+      // since_version only for a snapshot the server confirmed for THIS
+      // identity (#738) — a persisted or other-identity one asks for a full answer.
       final data = await _client.pollFeatures(
-        configVersion: _configVersion,
+        configVersion: (epoch == _loadEpoch && _isConfirmed) ? _configVersion : 0,
         userId: userId,
-        userIdHash: userIdHash,
+        anonymousFallback: userId == null,
       );
       // The identity may have changed while this poll was in flight (sign-out /
       // sign-in / identify). Drop a stale poll's result — otherwise it would
@@ -306,15 +365,20 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
       // disk key. (Timer.cancel only stops future ticks, not an in-flight one.)
       if (epoch != _loadEpoch) return;
       if (data.isEmpty) return;
-      if (data['config_version'] is int) _configVersion = data['config_version'] as int;
+      final v = data['config_version'];
       // up_to_date short-circuit (server config unchanged since our version) —
-      // no `features` payload; just keep the version cursor moving.
-      if (data['up_to_date'] != true) {
+      // no `features` payload; just keep the version cursor moving (only ever
+      // sent for a confirmed snapshot, see since_version above).
+      if (data['up_to_date'] == true) {
+        if (v is int && _isConfirmed) _configVersion = v;
+      } else {
         final features = data['features'] as Map<String, dynamic>?;
         if (features != null) {
+          if (v is int) _configVersion = v;
           _cache = features.map(
             (key, value) => MapEntry(key, ResolvedFeature.fromWire(value as Map<String, dynamic>)),
           );
+          _confirm(epoch);
           await _writeDiskCache(userId); // this poll's identity, not live _userId
           _safeNotify();
         }
@@ -328,8 +392,7 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
     // can be dropped if a newer load supersedes it.
     final epoch = _loadEpoch;
     final userId = _userId;
-    final userIdHash = _userIdHash;
-    _pollTimer = Timer.periodic(_pollInterval, (_) => _poll(epoch, userId, userIdHash));
+    _pollTimer = Timer.periodic(_pollInterval, (_) => _poll(epoch, userId));
   }
 
   void _stopPolling() {
@@ -349,7 +412,8 @@ class OneloFeatures extends ChangeNotifier with WidgetsBindingObserver {
       if (raw == null || raw.isEmpty) return;
       final data = jsonDecode(raw) as Map<String, dynamic>;
       if (epoch != _loadEpoch) return; // superseded before we could apply it
-      if (data['config_version'] is int) _configVersion = data['config_version'] as int;
+      // Not confirmed for this run: render it, but keep the version cursor at 0
+      // so the first poll asks for a full answer (#738).
       final features = data['features'] as Map<String, dynamic>?;
       if (features != null) {
         _cache = features.map(

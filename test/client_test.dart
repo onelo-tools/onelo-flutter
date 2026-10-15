@@ -4,6 +4,7 @@ import 'package:mocktail/mocktail.dart';
 import 'package:http/http.dart' as http;
 import 'package:onelo/src/client.dart';
 import 'package:onelo/src/types.dart';
+import 'package:onelo/src/marketing_consent.dart';
 
 class MockHttpClient extends Mock implements http.Client {}
 class FakeUri extends Fake implements Uri {}
@@ -128,6 +129,20 @@ void main() {
           .single as Uri;
       expect(uri.queryParameters.containsKey('environment'), isFalse);
     });
+
+    test('poll sends the key as X-Publishable-Key and NOT in the query string (ADR-0003, #105)', () async {
+      final mock = MockHttpClient();
+      when(() => mock.get(any(), headers: any(named: 'headers')))
+          .thenAnswer((_) async => http.Response('{}', 200));
+      final client = _client(mock: mock);
+      await client.pollFeatures(configVersion: 0);
+      final captured = verify(() => mock.get(captureAny(), headers: captureAny(named: 'headers'))).captured;
+      final uri = captured[0] as Uri;
+      final headers = captured[1] as Map<String, String>;
+      expect(headers['X-Publishable-Key'], equals('pk_test'));
+      expect(uri.queryParameters.containsKey('key'), isFalse);
+      expect(uri.toString(), isNot(contains('pk_test')));
+    });
   });
 
   group('OneloClient.submitForm', () {
@@ -171,6 +186,23 @@ void main() {
       expect(result.success, isTrue);
       expect(result.alreadyJoined, isTrue);
       expect(result.position, equals(7));
+    });
+  });
+
+  group('OneloClient.joinWaitlist — consent flags (#818)', () {
+    test('sends the given checkboxes, and no consent field without them', () async {
+      final mock = MockHttpClient();
+      final bodies = <Map<String, dynamic>>[];
+      when(() => mock.post(any(), headers: any(named: 'headers'), body: any(named: 'body')))
+        .thenAnswer((inv) async {
+          bodies.add(jsonDecode(inv.namedArguments[#body] as String) as Map<String, dynamic>);
+          return http.Response('{"ok":true,"position":1}', 200);
+        });
+      final client = _client(mock: mock);
+      await client.joinWaitlist('beta', 'a@b.c', consent: const OneloWaitlistConsent(marketing: true));
+      await client.joinWaitlist('beta', 'a@b.c');
+      expect(bodies[0]['consent'], {'marketing': true});
+      expect(bodies[1].containsKey('consent'), isFalse);
     });
   });
 }
