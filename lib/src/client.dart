@@ -355,6 +355,10 @@ class OneloClient {
       OneloFeaturesErrorKind.networkError, 'module-token failed (${response.statusCode})');
   }
 
+  /// The raw answer (status + body) with the same security headers — for
+  /// [OneloAffiliates] (#929), which reads the status instead of throwing.
+  Future<http.Response> postRawPublic(String path, Map<String, dynamic> body) => _postRaw(path, body);
+
   /// Public wrapper for use by other SDK classes (e.g. OneloPaywall).
   Future<Map<String, dynamic>> post(String path, Map<String, dynamic> body) =>
       _post(path, body);

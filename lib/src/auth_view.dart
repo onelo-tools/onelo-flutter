@@ -83,7 +83,15 @@ bool signOutBeforeRestart(String? error, String? url) {
 /// divider are drawn only when the app has social providers, matching Swift's
 /// AuthSkeletonView (with-socials / without-socials). Distinct from the portal
 /// skeleton (subscription cards, not a sign-in form).
-String _authSkeletonHtml(int socials, OneloBrandTokens t) {
+/// Test seam for the skeleton shape (#948).
+@visibleForTesting
+String debugAuthSkeletonHtml(int socials, OneloBrandTokens t, {bool magicLink = false}) =>
+    _authSkeletonHtml(socials, t, magicLink: magicLink);
+
+String _authSkeletonHtml(int socials, OneloBrandTokens t, {bool magicLink = false}) {
+  // Magic-link row sits between the password and the CTA, like HostedAuthForm
+  // and the JS skeleton (#948). Off when unknown → never a phantom row.
+  final magic = magicLink ? '<div class="sk magic"></div>' : '';
   final pills = List.generate(
     socials.clamp(0, 4),
     (_) => '<div class="strong pill"></div>',
@@ -117,6 +125,7 @@ ${t.skeletonCss}
 .lblrow{display:flex;justify-content:space-between;align-items:center}
 .lbl2{width:58px;height:11px;border-radius:4px}
 .forgot{width:90px;height:11px;opacity:0.7;border-radius:4px}
+.magic{width:190px;height:12px;opacity:0.6;align-self:center;border-radius:4px}
 .cta{height:48px;border-radius:${t.buttonRadius.round()}px;margin-top:6px}
 .signup{width:200px;height:12px;opacity:0.6;border-radius:4px;margin:16px auto 0}
 .powered{width:150px;height:32px;border-radius:16px;opacity:0.4;margin:24px auto 0}
@@ -131,7 +140,7 @@ $pills$divider
 <div class="strong input"></div>
 <div class="lblrow"><div class="sk lbl2"></div><div class="sk forgot"></div></div>
 <div class="strong input"></div>
-<div class="strong cta"></div>
+$magic<div class="strong cta"></div>
 </div>
 <div class="sk signup"></div>
 <div class="sk powered"></div>
@@ -177,6 +186,7 @@ class _OneloAuthViewState extends State<OneloAuthView> {
   /// OAuth-provider count the currently-loaded skeleton was rendered with (-1 =
   /// none yet). Lets us repaint the skeleton once providers become known.
   int _skeletonSocials = -1;
+  bool _skeletonMagic = false;
 
   /// Brand tokens the loaded skeleton was painted with (#681) — a config that
   /// lands after first paint repaints it in the app's colours.
@@ -263,11 +273,12 @@ class _OneloAuthViewState extends State<OneloAuthView> {
     final controller = _controller;
     if (url == null || url == _loadedUrl || controller == null) return;
     final count = _socialCount();
-    if (count != _skeletonSocials || OneloBrand.current != _skeletonTokens) {
+    if (count != _skeletonSocials || widget.auth.magicLinkEnabled != _skeletonMagic || OneloBrand.current != _skeletonTokens) {
       _skeletonSocials = count;
+      _skeletonMagic = widget.auth.magicLinkEnabled;
       _skeletonTokens = OneloBrand.current;
       _pendingUrl = url;
-      controller.loadHtmlString(_authSkeletonHtml(count, OneloBrand.current));
+      controller.loadHtmlString(_authSkeletonHtml(count, OneloBrand.current, magicLink: widget.auth.magicLinkEnabled));
       // Safety net: if the skeleton's onPageFinished never fires (platform
       // quirk), load the real URL anyway so we can't get stuck on the skeleton.
       Future.delayed(const Duration(seconds: 2), () {
@@ -294,8 +305,9 @@ class _OneloAuthViewState extends State<OneloAuthView> {
       // we fetch a fresh URL over the network.
       _pendingUrl = null;
       _skeletonSocials = _socialCount();
+      _skeletonMagic = widget.auth.magicLinkEnabled;
       _skeletonTokens = OneloBrand.current;
-      _controller?.loadHtmlString(_authSkeletonHtml(_socialCount(), OneloBrand.current));
+      _controller?.loadHtmlString(_authSkeletonHtml(_socialCount(), OneloBrand.current, magicLink: widget.auth.magicLinkEnabled));
       _loadedUrl = null;
       final url = await widget.auth.refreshHostedUrl();
       if (!mounted) return;
@@ -458,8 +470,9 @@ class _OneloAuthViewState extends State<OneloAuthView> {
       // Paint the skeleton immediately (with whatever provider count is known so
       // far — repainted with the right pills once providers resolve). The real
       // hosted URL is loaded by _showHosted; re-loaded fresh on sign-out.
-      ..loadHtmlString(_authSkeletonHtml(_socialCount(), OneloBrand.current));
+      ..loadHtmlString(_authSkeletonHtml(_socialCount(), OneloBrand.current, magicLink: widget.auth.magicLinkEnabled));
     _skeletonSocials = _socialCount();
+    _skeletonMagic = widget.auth.magicLinkEnabled;
     _skeletonTokens = OneloBrand.current;
   }
 

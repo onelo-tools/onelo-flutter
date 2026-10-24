@@ -72,9 +72,15 @@ void main() {
 
   test('skeleton CSS uses the card / border / track tokens and field radius', () {
     final css = OneloBrandTokens.parse(_served).skeletonCss;
-    expect(css, contains('.sk{background-color:#ffffff'));
+    // #948: light page → soft blocks take the border colour (card = ground).
+    expect(css, contains('.sk{background-color:#e4e4e7'));
     expect(css, contains('.strong{background-color:#e4e4e7'));
     expect(css, contains('border-radius:7px'));
     expect(css, isNot(contains('rgba(255,255,255,0.04)')));
+  });
+
+  test('#948 dark page keeps the soft blocks on the card colour', () {
+    final css = OneloBrandTokens.parse({..._served, 'light_bg': false}).skeletonCss;
+    expect(css, contains('.sk{background-color:#ffffff'));
   });
 }

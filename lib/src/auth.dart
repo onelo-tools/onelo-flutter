@@ -83,6 +83,7 @@ class OneloAuth extends ChangeNotifier {
   /// (Play Integrity is then skipped). Ignored on iOS.
   int? _cloudProjectNumber;
   List<String> _oauthProviders = [];
+  bool _magicLinkEnabled = false;
 
   /// iOS App Attest manager. Owned by [Onelo], set here after construction so
   /// auth can (a) trigger attestation once `/api/sdk/config` reports
@@ -303,6 +304,11 @@ class OneloAuth extends ChangeNotifier {
   /// from `/api/sdk/config`. Empty until [initialize] runs. Mirrors Swift
   /// `oauthProviders` — use it to render the right provider buttons.
   List<String> get oauthProviders => List.unmodifiable(_oauthProviders);
+
+  /// Whether the hosted sign-in form shows the magic-link button, from
+  /// `/api/sdk/config` `magic_link_enabled`. False until known, so the skeleton
+  /// never flashes a row the form will not show (#948).
+  bool get magicLinkEnabled => _magicLinkEnabled;
 
   /// The deep-link callback scheme configured for this app (e.g. `myapp`).
   /// Exposed so other SDK modules (e.g. [OneloCustomerPortal]) can read it
@@ -1125,6 +1131,7 @@ class OneloAuth extends ChangeNotifier {
         if (data['oauth_providers'] is List) {
           _oauthProviders = (data['oauth_providers'] as List).whereType<String>().toList();
         }
+        _magicLinkEnabled = data['magic_link_enabled'] == true;
         _signupMarketingConsent = OneloSignupMarketingConsent.fromConfig(data);
       }
     } catch (e) {

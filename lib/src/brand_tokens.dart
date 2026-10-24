@@ -262,13 +262,17 @@ class OneloBrandTokens {
         textStyle: TextStyle(fontFamily: bodyFontFamily, fontWeight: FontWeight.w600),
       );
 
+  /// Soft skeleton fill: card colour on a dark page; on a light page the card
+  /// is white like the ground, so the border colour (#948, matches onelo-core).
+  String get skeletonSoftFill => lightBg ? border : cardBg;
+
   /// Shimmer placeholder CSS for WebView skeletons (`.sk` soft, `.strong` field).
   String get skeletonCss {
     final sweep = 'background-image:linear-gradient(90deg,transparent 0%,$spinnerTrack 50%,transparent 100%);'
         'background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;'
         'animation:onelo-shimmer 2.4s linear infinite';
     return '@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}\n'
-        '.sk{background-color:$cardBg;$sweep;border-radius:${fieldRadius.round()}px}\n'
+        '.sk{background-color:$skeletonSoftFill;$sweep;border-radius:${fieldRadius.round()}px}\n'
         '.strong{background-color:$border;$sweep;border-radius:${fieldRadius.round()}px}';
   }
 }

@@ -6,7 +6,7 @@
 /// Sent to the backend as the `X-Sdk-Version` header on every request so the
 /// dashboard can detect + warn about outdated SDKs (mirrors Swift
 /// `OneloSDK.sdkVersion`, which the Flutter SDK previously never sent).
-const String oneloFlutterSdkVersion = '1.53.0';
+const String oneloFlutterSdkVersion = '1.54.0';
 
 /// Registry key the dashboard compares [oneloFlutterSdkVersion] against
 /// (`LATEST_SDK_VERSIONS['onelo-flutter']`). Sent as `X-Onelo-Sdk-Name` next

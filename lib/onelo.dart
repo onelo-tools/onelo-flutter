@@ -15,6 +15,7 @@ import 'src/monitor.dart';
 import 'src/paywall.dart';
 import 'src/forms.dart';
 import 'src/waitlist.dart';
+import 'src/affiliates.dart';
 import 'src/feedback.dart';
 import 'src/customer_portal.dart';
 import 'src/customer_portal_view.dart';
@@ -32,6 +33,7 @@ export 'src/monitor.dart' hide errorOriginOf;
 export 'src/paywall.dart';
 export 'src/forms.dart';
 export 'src/waitlist.dart';
+export 'src/affiliates.dart';
 export 'src/marketing_consent.dart';
 export 'src/feedback.dart';
 export 'src/customer_portal.dart';
@@ -48,6 +50,8 @@ class Onelo {
   late final OneloPaywall paywall;
   late final OneloForms forms;
   late final OneloWaitlist waitlist;
+  /// Affiliate referral capture (#929): `affiliates.capture(uri, consent: …)`.
+  late final OneloAffiliates affiliates;
   late final OneloFeedback feedback;
   late final OneloCustomerPortal customerPortal;
   late final OneloStore store;
@@ -241,6 +245,10 @@ class Onelo {
     paywall = OneloPaywall.withClient(client);
     forms = OneloForms(client);
     waitlist = OneloWaitlist(client);
+    affiliates = OneloAffiliates(client, () async {
+      final s = auth.currentSession;
+      return s == null ? null : (s.accessToken, s.user.id);
+    });
     feedback = OneloFeedback(client, features);
     customerPortal = OneloCustomerPortal(
       apiUrl: apiUrl,
@@ -310,6 +318,9 @@ class Onelo {
         _lastFeaturesUserId = userId;
         _lastFeaturesEntitlement = entitlement;
         features.load(userId);
+        // #929: a referral kept on this device goes to the user who signs in.
+        // ignore: discarded_futures
+        if (userId != null) affiliates.claimForSession();
       } else if (entitlement != _lastFeaturesEntitlement) {
         // Same user, entitlement changed (plan up/downgrade) → light REST
         // re-resolve so newly unlocked/locked features surface immediately
